@@ -22,6 +22,7 @@
 #include <maths/common/CBasicStatistics.h>
 #include <maths/common/CBasicStatisticsPersist.h>
 #include <maths/common/CChecksum.h>
+#include <maths/common/CMathsFuncs.h>
 #include <maths/common/CNormalMeanPrecConjugate.h>
 #include <maths/common/CPrior.h>
 #include <maths/common/CRestoreParams.h>
@@ -427,7 +428,24 @@ void winsorise(const TDoubleDoublePr& interval, TTuple& category) {
     double a = interval.first;
     double b = interval.second;
     double m = CBasicStatistics::mean(category);
-    double sigma = std::sqrt(CBasicStatistics::maximumLikelihoodVariance(category));
+    double variance = CBasicStatistics::maximumLikelihoodVariance(category);
+    
+    // Validate variance before computing sigma to prevent NaN propagation
+    if (CMathsFuncs::isNan(variance) || CMathsFuncs::isInf(variance) || variance < 0.0) {
+        LOG_ERROR(<< "Invalid variance detected in winsorise: variance = " << variance
+                  << ", category = " << category);
+        return;
+    }
+    
+    double sigma = std::sqrt(variance);
+    
+    // Additional validation: ensure sigma is finite and positive before creating distribution
+    if (CMathsFuncs::isNan(sigma) || CMathsFuncs::isInf(sigma) || sigma <= 0.0) {
+        LOG_ERROR(<< "Invalid sigma detected in winsorise: sigma = " << sigma
+                  << ", variance = " << variance << ", category = " << category);
+        return;
+    }
+    
     double t = 3.0 * sigma;
 
     double xa = m - a;

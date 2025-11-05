@@ -947,6 +947,17 @@ bool COneOfNPrior::probabilityOfLessLikelySamples(maths_t::EProbabilityCalculati
             return false;
         }
 
+        // Early NaN detection: check for NaN values immediately after calculation
+        // before accumulating them, which would propagate NaN throughout the system
+        if (CMathsFuncs::isNan(modelLowerBound) || CMathsFuncs::isNan(modelUpperBound)) {
+            LOG_ERROR(<< "NaN detected in probability calculation from model: modelLowerBound = "
+                      << modelLowerBound << ", modelUpperBound = " << modelUpperBound
+                      << ", samples = " << samples << ", weights = " << weights);
+            lowerBound = 0.0;
+            upperBound = 1.0;
+            return false;
+        }
+
         LOG_TRACE(<< "weight = " << weight << ", modelLowerBound = " << modelLowerBound
                   << ", modelUpperBound = " << modelLowerBound);
 
@@ -962,13 +973,31 @@ bool COneOfNPrior::probabilityOfLessLikelySamples(maths_t::EProbabilityCalculati
     }
 
     if (CMathsFuncs::isNan(lowerBound)) {
+        LOG_ERROR(<< "NaN detected in accumulated lowerBound, samples = " << samples
+                  << ", weights = " << weights);
         lowerBound = 0.0;
+        upperBound = 1.0;
+        return false;
     }
     if (CMathsFuncs::isNan(upperBound)) {
+        LOG_ERROR(<< "NaN detected in accumulated upperBound, samples = " << samples
+                  << ", weights = " << weights);
+        lowerBound = 0.0;
         upperBound = 1.0;
+        return false;
     }
     lowerBound = CTools::truncate(lowerBound, 0.0, 1.0);
     upperBound = CTools::truncate(upperBound, 0.0, 1.0);
+    
+    // Guard against accessing empty accumulator - this can happen if loop never
+    // executes or exits early, leading to SIGSEGV
+    if (tail_.count() == 0) {
+        LOG_ERROR(<< "Empty accumulator detected in probabilityOfLessLikelySamples, "
+                  << "samples = " << samples << ", weights = " << weights
+                  << ", logWeights.size() = " << logWeights.size());
+        tail = maths_t::E_UndeterminedTail;
+        return false;
+    }
     tail = tail_[0].second;
 
     LOG_TRACE(<< "Probability = [" << lowerBound << "," << upperBound << "]");

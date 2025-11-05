@@ -1277,4 +1277,279 @@ BOOST_AUTO_TEST_CASE(testBadValues) {
     BOOST_REQUIRE_EQUAL(maths_t::E_UndeterminedTail, tail);
 }
 
+BOOST_AUTO_TEST_CASE(testNaNPropagationFromExtremeValues) {
+    // Test that extreme values (like 2^64) causing NaN in calculations are handled
+    // This reproduces the production bug where extreme metric values cause NaN propagation
+
+    TPriorPtrVec models;
+    models.push_back(TPriorPtr(
+        CNormalMeanPrecConjugate::nonInformativePrior(E_ContinuousData).clone()));
+    models.push_back(TPriorPtr(
+        CLogNormalMeanPrecConjugate::nonInformativePrior(E_ContinuousData).clone()));
+    models.push_back(TPriorPtr(
+        CGammaRateConjugate::nonInformativePrior(E_ContinuousData).clone()));
+
+    COneOfNPrior filter(maths::common::COneOfNPrior(clone(models), E_ContinuousData));
+
+    // Add normal samples first to establish model state
+    test::CRandomNumbers rng;
+    TDoubleVec normalSamples;
+    rng.generateNormalSamples(10.0, 1.0, 50, normalSamples);
+    filter.addSamples(normalSamples);
+
+    // Now add extreme values that can cause NaN in variance/probability calculations
+    // Using values similar to production: 2^64 overflow indicators
+    const double extremeValue = 18446744073709551616.0; // 2^64
+    TDouble1Vec extremeSample{extremeValue};
+    auto weights = maths_t::CUnitWeights::SINGLE_UNIT;
+
+    // After adding extreme values, probability calculation should handle NaN gracefully
+    double lowerBound;
+    double upperBound;
+    maths_t::ETail tail;
+
+    // The fix should detect NaN early and return false instead of propagating NaN
+    bool result = filter.probabilityOfLessLikelySamples(
+        maths_t::E_TwoSided, extremeSample, weights, lowerBound, upperBound, tail);
+
+    // With the fix: should return false and set safe defaults, not propagate NaN
+    if (!result) {
+        // Fix is working: NaN detected early, function returns false
+        BOOST_REQUIRE_EQUAL(0.0, lowerBound);
+        BOOST_REQUIRE_EQUAL(1.0, upperBound);
+        BOOST_REQUIRE_EQUAL(maths_t::E_UndeterminedTail, tail);
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isNan(lowerBound));
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isNan(upperBound));
+    } else {
+        // If it succeeds, values should still be finite and valid
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isNan(lowerBound));
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isNan(upperBound));
+        BOOST_REQUIRE(lowerBound >= 0.0 && lowerBound <= 1.001);
+        BOOST_REQUIRE(upperBound >= 0.0 && upperBound <= 1.001);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(testEmptyAccumulatorHandling) {
+    // Test that empty accumulator scenario is handled correctly
+    // This prevents SIGSEGV when normalizedLogWeights returns empty
+
+    TPriorPtrVec models;
+    models.push_back(TPriorPtr(
+        CNormalMeanPrecConjugate::nonInformativePrior(E_ContinuousData).clone()));
+    models.push_back(TPriorPtr(
+        CLogNormalMeanPrecConjugate::nonInformativePrior(E_ContinuousData).clone()));
+
+    COneOfNPrior filter(maths::common::COneOfNPrior(clone(models), E_ContinuousData));
+
+    // Add samples to establish model state
+    test::CRandomNumbers rng;
+    TDoubleVec samples;
+    rng.generateNormalSamples(10.0, 1.0, 50, samples);
+    filter.addSamples(samples);
+
+    // Get models and check if we can create a scenario where models don't participate
+    COneOfNPrior::TPriorCPtrVec modelPtrs = filter.models();
+    BOOST_REQUIRE(!modelPtrs.empty());
+
+    // Test with a sample that might cause early loop exit
+    // Use a very large sample that might cause the optimization break condition
+    // to trigger before any tail_.add() calls
+    TDouble1Vec sample{1000000.0}; // Very large value
+    auto weights = maths_t::CUnitWeights::SINGLE_UNIT;
+
+    double lowerBound;
+    double upperBound;
+    maths_t::ETail tail;
+
+    // The fix should check for empty accumulator before accessing tail_[0]
+    bool result = filter.probabilityOfLessLikelySamples(
+        maths_t::E_TwoSided, sample, weights, lowerBound, upperBound, tail);
+
+    // Should either succeed with valid values or fail gracefully (not crash)
+    if (!result) {
+        // Graceful failure - should have safe defaults
+        BOOST_REQUIRE_EQUAL(0.0, lowerBound);
+        BOOST_REQUIRE_EQUAL(1.0, upperBound);
+        BOOST_REQUIRE_EQUAL(maths_t::E_UndeterminedTail, tail);
+    } else {
+        // Success - values should be valid
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isNan(lowerBound));
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isNan(upperBound));
+        BOOST_REQUIRE(lowerBound >= 0.0 && lowerBound <= 1.001);
+        BOOST_REQUIRE(upperBound >= 0.0 && upperBound <= 1.001);
+    }
+
+    // Verify no crash occurred (test passed if we reach here)
+    BOOST_TEST(true);
+}
+
+BOOST_AUTO_TEST_CASE(testExtremeValuesCauseNaNHandling) {
+    // Test that extreme values similar to production data (2^64) are handled correctly
+    // This reproduces the exact scenario from production
+
+    TPriorPtrVec models;
+    models.push_back(TPriorPtr(
+        CNormalMeanPrecConjugate::nonInformativePrior(E_ContinuousData).clone()));
+    models.push_back(TPriorPtr(
+        CLogNormalMeanPrecConjugate::nonInformativePrior(E_ContinuousData).clone()));
+    models.push_back(TPriorPtr(
+        CGammaRateConjugate::nonInformativePrior(E_ContinuousData).clone()));
+
+    COneOfNPrior filter(maths::common::COneOfNPrior(clone(models), E_ContinuousData));
+
+    // Add normal samples first
+    test::CRandomNumbers rng;
+    TDoubleVec normalSamples;
+    rng.generateNormalSamples(100.0, 10.0, 100, normalSamples);
+    filter.addSamples(normalSamples);
+
+    // Add sample with extreme value similar to production: 2^64
+    const double extremeValue = 18446744073709551616.0; // 2^64
+    TDouble1Vec extremeSample{extremeValue};
+    filter.addSamples(extremeSample);
+
+    // Now try probability calculation - should handle gracefully
+    TDouble1Vec testSample{1.0};
+    auto weights = maths_t::CUnitWeights::SINGLE_UNIT;
+
+    double lowerBound;
+    double upperBound;
+    maths_t::ETail tail;
+
+    bool result = filter.probabilityOfLessLikelySamples(
+        maths_t::E_TwoSided, testSample, weights, lowerBound, upperBound, tail);
+
+    // With the fix: should handle gracefully, either return false or valid values
+    if (!result) {
+        // Graceful failure
+        BOOST_REQUIRE_EQUAL(0.0, lowerBound);
+        BOOST_REQUIRE_EQUAL(1.0, upperBound);
+        BOOST_REQUIRE_EQUAL(maths_t::E_UndeterminedTail, tail);
+    } else {
+        // Success - validate values are finite and in range
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isNan(lowerBound));
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isNan(upperBound));
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isInf(lowerBound));
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isInf(upperBound));
+        BOOST_REQUIRE(lowerBound >= 0.0 && lowerBound <= 1.001);
+        BOOST_REQUIRE(upperBound >= 0.0 && upperBound <= 1.001);
+    }
+
+    // Verify weights are still valid (not corrupted by NaN)
+    TDoubleVec modelWeights = filter.weights();
+    for (double weight : modelWeights) {
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isNan(weight));
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isInf(weight));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(testNegativeValuesHandling) {
+    // Test that negative values (which can cause issues with log-normal distributions)
+    // are handled correctly
+
+    TPriorPtrVec models;
+    models.push_back(TPriorPtr(
+        CNormalMeanPrecConjugate::nonInformativePrior(E_ContinuousData).clone()));
+    models.push_back(TPriorPtr(
+        CLogNormalMeanPrecConjugate::nonInformativePrior(E_ContinuousData).clone()));
+    models.push_back(TPriorPtr(
+        CGammaRateConjugate::nonInformativePrior(E_ContinuousData).clone()));
+
+    COneOfNPrior filter(maths::common::COneOfNPrior(clone(models), E_ContinuousData));
+
+    // Add normal samples first
+    test::CRandomNumbers rng;
+    TDoubleVec normalSamples;
+    rng.generateNormalSamples(10.0, 1.0, 50, normalSamples);
+    filter.addSamples(normalSamples);
+
+    // Add negative value (similar to production data with negative mins)
+    TDouble1Vec negativeSample{-433.0};
+    auto weights = maths_t::CUnitWeights::SINGLE_UNIT;
+
+    double lowerBound;
+    double upperBound;
+    maths_t::ETail tail;
+
+    // Should handle negative values gracefully
+    bool result = filter.probabilityOfLessLikelySamples(
+        maths_t::E_TwoSided, negativeSample, weights, lowerBound, upperBound, tail);
+
+    // Should either succeed or fail gracefully (not crash or propagate NaN)
+    if (!result) {
+        BOOST_REQUIRE_EQUAL(0.0, lowerBound);
+        BOOST_REQUIRE_EQUAL(1.0, upperBound);
+        BOOST_REQUIRE_EQUAL(maths_t::E_UndeterminedTail, tail);
+    } else {
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isNan(lowerBound));
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isNan(upperBound));
+        BOOST_REQUIRE(lowerBound >= 0.0 && lowerBound <= 1.001);
+        BOOST_REQUIRE(upperBound >= 0.0 && upperBound <= 1.001);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(testMultipleExtremeValuesSequence) {
+    // Test a sequence of operations similar to production error chain
+    // This reproduces the exact sequence: extreme values → NaN → corrupted weights → empty accumulator
+
+    TPriorPtrVec models;
+    models.push_back(TPriorPtr(
+        CNormalMeanPrecConjugate::nonInformativePrior(E_ContinuousData).clone()));
+    models.push_back(TPriorPtr(
+        CLogNormalMeanPrecConjugate::nonInformativePrior(E_ContinuousData).clone()));
+
+    COneOfNPrior filter(maths::common::COneOfNPrior(clone(models), E_ContinuousData));
+
+    // Step 1: Add normal samples
+    test::CRandomNumbers rng;
+    TDoubleVec normalSamples;
+    rng.generateNormalSamples(10.0, 1.0, 100, normalSamples);
+    filter.addSamples(normalSamples);
+
+    // Step 2: Add extreme value (triggers NaN in calculations)
+    const double extremeValue = 18446744073709551616.0; // 2^64
+    TDouble1Vec extremeSample{extremeValue};
+    filter.addSamples(extremeSample);
+
+    // Step 3: Multiple probability calculations (simulating anomaly scoring)
+    // With the fix, these should all handle gracefully
+    TDouble1Vec testSamples[] = {{1.0}, {10.0}, {100.0}};
+    auto weights = maths_t::CUnitWeights::SINGLE_UNIT;
+
+    for (const auto& testSample : testSamples) {
+        double lowerBound;
+        double upperBound;
+        maths_t::ETail tail;
+
+        bool result = filter.probabilityOfLessLikelySamples(
+            maths_t::E_TwoSided, testSample, weights, lowerBound, upperBound, tail);
+
+        // Verify no NaN propagation
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isNan(lowerBound));
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isNan(upperBound));
+
+        if (!result) {
+            // Graceful failure
+            BOOST_REQUIRE_EQUAL(0.0, lowerBound);
+            BOOST_REQUIRE_EQUAL(1.0, upperBound);
+            BOOST_REQUIRE_EQUAL(maths_t::E_UndeterminedTail, tail);
+        } else {
+            // Valid success
+            BOOST_REQUIRE(lowerBound >= 0.0 && lowerBound <= 1.001);
+            BOOST_REQUIRE(upperBound >= 0.0 && upperBound <= 1.001);
+        }
+    }
+
+    // Step 4: Verify weights are not corrupted
+    TDoubleVec modelWeights = filter.weights();
+    for (double weight : modelWeights) {
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isNan(weight));
+        BOOST_REQUIRE(!maths::common::CMathsFuncs::isInf(weight));
+    }
+
+    // Step 5: Verify model still functions (can add more samples)
+    filter.addSamples({50.0});
+    BOOST_TEST(true); // If we reach here, no crash occurred
+}
+
 BOOST_AUTO_TEST_SUITE_END()

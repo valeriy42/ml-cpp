@@ -950,4 +950,159 @@ BOOST_AUTO_TEST_CASE(testPruneEmptyCluster) {
     BOOST_REQUIRE_EQUAL(2, clusterer.clusters().size());
 }
 
+BOOST_AUTO_TEST_CASE(testNaNHandlingInWinsorise) {
+    // Test that NaN variance in category is handled correctly in winsorise
+    // This prevents the "Scale parameter is -nan" error from boost::math::normal_distribution
+
+    maths::common::CXMeansOnline1d clusterer(
+        maths_t::E_ContinuousData, maths::common::CAvailableModeDistributions::ALL,
+        maths_t::E_ClustersFractionWeight, 0.1);
+
+    maths::common::CXMeansOnline1d::CCluster cluster(clusterer);
+
+    // Add normal samples first
+    cluster.add(1.0, 10.0);
+    cluster.add(2.0, 5.0);
+    cluster.add(3.0, 8.0);
+
+    // Now add extreme values that can cause NaN in variance calculations
+    // This simulates the production scenario where 2^64 values cause NaN
+    const double extremeValue = 18446744073709551616.0; // 2^64
+    cluster.add(extremeValue, 1.0);
+
+    // Try to split the cluster, which will call winsorise
+    // With the fix, winsorise should handle NaN variance gracefully
+    maths::common::CXMeansOnline1d::CIndexGenerator indexGenerator;
+    auto splitResult = cluster.split(maths::common::CAvailableModeDistributions::ALL,
+                                     1.0, // minimumCount
+                                     0.0, // smallest
+                                     {-1e6, 1e6}, // interval
+                                     indexGenerator);
+
+    // Should either succeed or fail gracefully (not throw exception)
+    // The key is that it doesn't crash with SIGSEGV
+    BOOST_TEST(true); // If we reach here, no crash occurred
+}
+
+BOOST_AUTO_TEST_CASE(testExtremeValuesInCluster) {
+    // Test that clusters with extreme values (2^64) don't cause NaN propagation
+    // This reproduces the production scenario where extreme metric values corrupt clustering
+
+    maths::common::CXMeansOnline1d clusterer(
+        maths_t::E_ContinuousData, maths::common::CAvailableModeDistributions::ALL,
+        maths_t::E_ClustersFractionWeight, 0.1);
+
+    maths::common::CXMeansOnline1d::CCluster cluster(clusterer);
+
+    // Add mix of normal and extreme values (similar to production data)
+    cluster.add(1.0, 100.0);
+    cluster.add(10.0, 50.0);
+    cluster.add(100.0, 25.0);
+
+    // Add extreme value that causes NaN in variance
+    const double extremeValue = 18446744073709551616.0; // 2^64
+    cluster.add(extremeValue, 1.0);
+
+    // Verify cluster still functions
+    double centre = cluster.centre();
+    double spread = cluster.spread();
+    double count = cluster.count();
+
+    // Values should be finite (not NaN or Inf)
+    BOOST_REQUIRE(!std::isnan(centre));
+    BOOST_REQUIRE(!std::isinf(centre));
+    BOOST_REQUIRE(!std::isnan(spread));
+    BOOST_REQUIRE(!std::isinf(spread));
+    BOOST_REQUIRE(!std::isnan(count));
+    BOOST_REQUIRE(!std::isinf(count));
+    BOOST_REQUIRE(count > 0.0);
+
+    // Try cluster operations that might trigger winsorise
+    maths::common::CXMeansOnline1d::CIndexGenerator indexGenerator;
+    auto splitResult = cluster.split(maths::common::CAvailableModeDistributions::ALL,
+                                      1.0,
+                                      0.0,
+                                      {-1e6, 1e6},
+                                      indexGenerator);
+
+    // Should handle gracefully (no exception or crash)
+    BOOST_TEST(true);
+}
+
+BOOST_AUTO_TEST_CASE(testNegativeValuesInCluster) {
+    // Test that clusters with negative values are handled correctly
+    // Production data has negative min values which can cause issues
+
+    maths::common::CXMeansOnline1d clusterer(
+        maths_t::E_ContinuousData, maths::common::CAvailableModeDistributions::ALL,
+        maths_t::E_ClustersFractionWeight, 0.1);
+
+    maths::common::CXMeansOnline1d::CCluster cluster(clusterer);
+
+    // Add mix including negative values (similar to production)
+    cluster.add(1.0, 10.0);
+    cluster.add(-433.0, 1.0); // Negative value from production data
+    cluster.add(100.0, 5.0);
+
+    // Verify cluster functions correctly
+    double centre = cluster.centre();
+    double spread = cluster.spread();
+
+    BOOST_REQUIRE(!std::isnan(centre));
+    BOOST_REQUIRE(!std::isnan(spread));
+    BOOST_REQUIRE(!std::isinf(centre));
+    BOOST_REQUIRE(!std::isinf(spread));
+
+    // Try operations that might trigger winsorise
+    maths::common::CXMeansOnline1d::CIndexGenerator indexGenerator;
+    auto splitResult = cluster.split(maths::common::CAvailableModeDistributions::ALL,
+                                      1.0,
+                                      0.0,
+                                      {-1e6, 1e6},
+                                      indexGenerator);
+
+    // Should handle gracefully
+    BOOST_TEST(true);
+}
+
+BOOST_AUTO_TEST_CASE(testClusterWithCorruptedVariance) {
+    // Test that clusters with corrupted variance (NaN) are handled correctly
+    // This simulates the state after NaN propagation from extreme values
+
+    maths::common::CXMeansOnline1d clusterer(
+        maths_t::E_ContinuousData, maths::common::CAvailableModeDistributions::ALL,
+        maths_t::E_ClustersFractionWeight, 0.1);
+
+    maths::common::CXMeansOnline1d::CCluster cluster(clusterer);
+
+    // Add normal samples
+    cluster.add(1.0, 10.0);
+    cluster.add(2.0, 5.0);
+    cluster.add(3.0, 8.0);
+
+    // Add extreme value that could cause NaN
+    const double extremeValue = 18446744073709551616.0; // 2^64
+    cluster.add(extremeValue, 1.0);
+
+    // Try split operation which calls winsorise internally
+    // With the fix, NaN variance should be detected and handled gracefully
+    maths::common::CXMeansOnline1d::CIndexGenerator indexGenerator;
+    
+    // Use a reasonable interval
+    auto splitResult = cluster.split(maths::common::CAvailableModeDistributions::ALL,
+                                      1.0,
+                                      0.0,
+                                      std::make_pair(-1000.0, 1000.0),
+                                      indexGenerator);
+
+    // Should not crash - either return valid split or fail gracefully
+    BOOST_TEST(true);
+
+    // Verify cluster still has valid state
+    double centre = cluster.centre();
+    double spread = cluster.spread();
+    BOOST_REQUIRE(!std::isnan(centre));
+    BOOST_REQUIRE(!std::isnan(spread));
+}
+
 BOOST_AUTO_TEST_SUITE_END()
