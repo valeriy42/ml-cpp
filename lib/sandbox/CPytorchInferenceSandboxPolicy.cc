@@ -53,9 +53,8 @@ SArgDirExtraction extractArgDirs(const std::vector<std::string>& args) {
             optionName.erase(0, 1);
         }
 
-        const bool isPathOption =
-            optionName == "input" || optionName == "output" || optionName == "restore" ||
-            optionName == "logPipe";
+        const bool isPathOption = optionName == "input" || optionName == "output" ||
+                                  optionName == "restore" || optionName == "logPipe";
         if (isPathOption == false) {
             continue;
         }

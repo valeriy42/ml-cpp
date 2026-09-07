@@ -446,9 +446,8 @@ BOOST_AUTO_TEST_CASE(testExtractArgDirsIgnoresScalarOptions) {
     // must not grant a mount or appear in rejectedPipeArgs.
     const ml::sandbox::SArgDirExtraction scalars{ml::sandbox::extractArgDirs(
         {"--validElasticLicenseKeyConfirmed=true", "--namedPipeConnectTimeout=1",
-         "--numThreadsPerAllocation=2", "--numAllocations=1",
-         "--cacheMemorylimitBytes=1048576", "--modelid=my-model", "--inputIsPipe",
-         "--modelid=/etc/passwd"})};
+         "--numThreadsPerAllocation=2", "--numAllocations=1", "--cacheMemorylimitBytes=1048576",
+         "--modelid=my-model", "--inputIsPipe", "--modelid=/etc/passwd"})};
     BOOST_TEST_REQUIRE(scalars.m_RejectedPipeArgs.empty());
     BOOST_TEST_REQUIRE(scalars.m_ArgDirs.empty());
     BOOST_TEST_REQUIRE(scalars.m_PipeDirAliasMappings.empty());

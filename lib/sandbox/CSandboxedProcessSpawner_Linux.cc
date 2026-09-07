@@ -262,8 +262,8 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
     }
 
     auto sandbox = std::shared_ptr<sandbox2::Sandbox2>(std::move(sandboxPtr));
-    const int pidFd =
-        static_cast<int>(::syscall(ML_NR_pidfd_open, static_cast<pid_t>(childPid), 0u));
+    const int pidFd = static_cast<int>(
+        ::syscall(ML_NR_pidfd_open, static_cast<pid_t>(childPid), 0u));
 
     const core::CProcess::TPid sandboxPid{childPid};
     std::uint64_t generation{0};
@@ -297,25 +297,26 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
     // spawner is destroyed, and a raw pointer would be dangling by the time the
     // sandboxee exits.
     try {
-        std::thread([sandboxPid, registry = m_PidRegistry, sandbox, generation]() {
-            const sandbox2::Result result{sandbox->AwaitResult()};
-            {
-                std::lock_guard<std::mutex> lock(registry->s_Mutex);
-                const auto it = registry->s_Children.find(sandboxPid);
-                if (it != registry->s_Children.end() &&
-                    it->second.s_Generation == generation) {
-                    closePidFdIfOpen(it->second.s_PidFd);
-                    registry->s_Children.erase(it);
+        std::thread(
+            [ sandboxPid, registry = m_PidRegistry, sandbox, generation ]() {
+                const sandbox2::Result result{sandbox->AwaitResult()};
+                {
+                    std::lock_guard<std::mutex> lock(registry->s_Mutex);
+                    const auto it = registry->s_Children.find(sandboxPid);
+                    if (it != registry->s_Children.end() &&
+                        it->second.s_Generation == generation) {
+                        closePidFdIfOpen(it->second.s_PidFd);
+                        registry->s_Children.erase(it);
+                    }
                 }
-            }
-            logSandboxeeTermination(sandboxPid, result);
-        }).detach();
+                logSandboxeeTermination(sandboxPid, result);
+            })
+            .detach();
     } catch (const std::exception& e) {
         {
             std::lock_guard<std::mutex> lock(m_PidRegistry->s_Mutex);
             const auto it = m_PidRegistry->s_Children.find(sandboxPid);
-            if (it != m_PidRegistry->s_Children.end() &&
-                it->second.s_Generation == generation) {
+            if (it != m_PidRegistry->s_Children.end() && it->second.s_Generation == generation) {
                 closePidFdIfOpen(it->second.s_PidFd);
                 m_PidRegistry->s_Children.erase(it);
             }
