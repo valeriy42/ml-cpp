@@ -14,6 +14,7 @@
 #include <core/CProcess.h>
 #include <sandbox/ImportExport.h>
 
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -55,8 +56,23 @@ public:
 private:
     using TPidSet = std::set<core::CProcess::TPid>;
 
-    mutable std::mutex m_Mutex;
-    TPidSet m_Pids;
+    //! \brief The set of live sandboxed PIDs, and the lock that guards it.
+    //!
+    //! DESCRIPTION:\n
+    //! Held behind a shared_ptr because the monitor thread that removes a PID
+    //! outlives the spawn() call that started it, and can outlive this object:
+    //! the controller may tear the spawner down while a sandboxed
+    //! pytorch_inference is still running, and the monitor only learns that the
+    //! sandboxee exited some time later. A raw pointer back to the spawner
+    //! would be dangling by then, so the monitor co-owns the registry instead
+    //! and the spawner needs no synchronisation in its destructor.
+    struct SPidRegistry {
+        mutable std::mutex s_Mutex;
+        TPidSet s_Pids;
+    };
+    using TPidRegistryPtr = std::shared_ptr<SPidRegistry>;
+
+    const TPidRegistryPtr m_PidRegistry{std::make_shared<SPidRegistry>()};
 };
 
 } // namespace sandbox

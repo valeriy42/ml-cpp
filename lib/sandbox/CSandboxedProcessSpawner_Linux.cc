@@ -237,22 +237,27 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
     LOG_INFO(<< "Spawned sandboxed pytorch_inference with PID " << childPid);
 
     {
-        std::lock_guard<std::mutex> lock(m_Mutex);
-        m_Pids.insert(childPid);
+        std::lock_guard<std::mutex> lock(m_PidRegistry->s_Mutex);
+        m_PidRegistry->s_Pids.insert(childPid);
     }
 
     // The sandboxee is a child of the Sandbox2 forkserver rather than of the
     // controller, so waitpid() never sees it. Own the sandbox instance on a
     // dedicated thread that keeps it alive for the lifetime of
     // pytorch_inference, waits for its result, logs termination, and removes
-    // the PID from the tracker so PID reuse cannot make terminateChild()
+    // the PID from the registry so PID reuse cannot make terminateChild()
     // signal an unrelated process.
+    //
+    // The thread co-owns the registry rather than capturing this: it can still
+    // be waiting on a live sandboxee when the spawner is destroyed, and a raw
+    // pointer would be dangling by the time the sandboxee exits.
     const core::CProcess::TPid sandboxPid{childPid};
-    CSandboxedProcessSpawner* self{this};
-    std::thread([ sandboxPid, self, sbx = std::move(sandboxPtr) ]() mutable {
+    std::thread([
+        sandboxPid, registry = m_PidRegistry, sbx = std::move(sandboxPtr)
+    ]() mutable {
         logSandboxeeTermination(sandboxPid, sbx->AwaitResult());
-        std::lock_guard<std::mutex> lock(self->m_Mutex);
-        self->m_Pids.erase(sandboxPid);
+        std::lock_guard<std::mutex> lock(registry->s_Mutex);
+        registry->s_Pids.erase(sandboxPid);
     })
         .detach();
 
@@ -268,8 +273,8 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
 }
 
 bool CSandboxedProcessSpawner::terminateChild(core::CProcess::TPid pid) {
-    std::lock_guard<std::mutex> lock(m_Mutex);
-    if (m_Pids.find(pid) == m_Pids.end()) {
+    std::lock_guard<std::mutex> lock(m_PidRegistry->s_Mutex);
+    if (m_PidRegistry->s_Pids.find(pid) == m_PidRegistry->s_Pids.end()) {
         LOG_WARN(<< "Will not attempt to kill sandboxed process " << pid
                  << ": not a child process");
         return false;
@@ -291,8 +296,8 @@ bool CSandboxedProcessSpawner::hasChild(core::CProcess::TPid pid) const {
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(m_Mutex);
-    return m_Pids.find(pid) != m_Pids.end();
+    std::lock_guard<std::mutex> lock(m_PidRegistry->s_Mutex);
+    return m_PidRegistry->s_Pids.find(pid) != m_PidRegistry->s_Pids.end();
 }
 
 } // namespace sandbox
