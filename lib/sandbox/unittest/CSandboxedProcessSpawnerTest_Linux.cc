@@ -16,6 +16,7 @@
 #include <core/CResourceLocator.h>
 #include <core/CStringUtils.h>
 
+#include <sandbox/CPytorchInferenceSandboxPolicy.h>
 #include <sandbox/CSandboxedProcessSpawner.h>
 
 #include <seccomp/CPytorchInferenceSyscallAllowlist.h>
@@ -30,6 +31,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <limits.h>
+#include <memory>
 #include <sched.h>
 #include <sstream>
 #include <sys/mount.h>
@@ -385,23 +387,42 @@ std::string makeTestDir() {
     return "/tmp/ml_sandbox_test_" + ml::core::CStringUtils::typeToString(::getpid());
 }
 
-bool spawnSandboxedWithTimeout(ml::sandbox::CSandboxedProcessSpawner& spawner,
-                               const std::string& processPath,
-                               const ml::sandbox::CSandboxedProcessSpawner::TStrVec& args,
+//! Everything the spawn thread writes to. Heap allocated and co-owned by that
+//! thread, so a timeout can abandon it without leaving the thread writing to a
+//! stack frame that has already gone away.
+struct SSpawnAttempt {
+    std::atomic<bool> s_Finished{false};
+    bool s_Result{false};
+    ml::core::CProcess::TPid s_ChildPid{0};
+    std::string s_FailureReason;
+};
+
+//! Run spawn() with a deadline, without ever leaving a detached thread holding
+//! references to expired state.
+//!
+//! Do not use std::async: if wait_for() times out, ~std::future still joins the
+//! stuck spawn thread and the test appears to hang indefinitely. Detaching is
+//! the way out of that, but it means the thread can outlive this call, so the
+//! spawner is co-owned via shared_ptr and the results live in a co-owned block
+//! rather than on the caller's stack. The arguments are copied into the thread
+//! for the same reason.
+bool spawnSandboxedWithTimeout(const std::shared_ptr<ml::sandbox::CSandboxedProcessSpawner>& spawner,
+                               std::string processPath,
+                               ml::sandbox::CSandboxedProcessSpawner::TStrVec args,
                                ml::core::CProcess::TPid& childPid,
                                std::string& failureReason,
                                std::chrono::seconds timeout) {
-    // Do not use std::async: if wait_for() times out, ~std::future still joins the
-    // stuck spawn thread and the test appears to hang indefinitely.
-    bool spawnResult{false};
-    std::atomic<bool> spawnFinished{false};
-    std::thread spawnThread([&]() {
-        spawnResult = spawner.spawn(processPath, args, childPid, &failureReason);
-        spawnFinished.store(true, std::memory_order_release);
+    auto attempt = std::make_shared<SSpawnAttempt>();
+    std::thread spawnThread([
+        spawner, attempt, path = std::move(processPath), spawnArgs = std::move(args)
+    ]() {
+        attempt->s_Result = spawner->spawn(path, spawnArgs, attempt->s_ChildPid,
+                                           &attempt->s_FailureReason);
+        attempt->s_Finished.store(true, std::memory_order_release);
     });
 
     const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (!spawnFinished.load(std::memory_order_acquire)) {
+    while (attempt->s_Finished.load(std::memory_order_acquire) == false) {
         if (std::chrono::steady_clock::now() >= deadline) {
             spawnThread.detach();
             failureReason = "Timed out waiting for Sandbox2 spawn after " +
@@ -412,10 +433,57 @@ bool spawnSandboxedWithTimeout(ml::sandbox::CSandboxedProcessSpawner& spawner,
     }
 
     spawnThread.join();
-    return spawnResult;
+    childPid = attempt->s_ChildPid;
+    failureReason = attempt->s_FailureReason;
+    return attempt->s_Result;
 }
 
 } // namespace
+
+// Independent of Sandbox2 availability: pure argument classification.
+BOOST_AUTO_TEST_CASE(testExtractArgDirsIgnoresScalarOptions) {
+    // Every option pytorch_inference actually receives alongside its pipes.
+    // None of these is a path, so none of them belongs in rejectedPipeArgs -
+    // operators are told to expect that list empty when triaging FIFO problems.
+    const ml::sandbox::SArgDirExtraction scalars{ml::sandbox::extractArgDirs(
+        {"--validElasticLicenseKeyConfirmed=true", "--namedPipeConnectTimeout=1",
+         "--numThreadsPerAllocation=2", "--numAllocations=1",
+         "--cacheMemorylimitBytes=1048576", "--modelid=my-model", "--inputIsPipe"})};
+    BOOST_TEST_REQUIRE(scalars.m_RejectedPipeArgs.empty());
+    BOOST_TEST_REQUIRE(scalars.m_ArgDirs.empty());
+    BOOST_TEST_REQUIRE(scalars.m_PipeDirAliasMappings.empty());
+}
+
+BOOST_AUTO_TEST_CASE(testExtractArgDirsMountsAbsolutePipeDirectories) {
+    // Deliberately a directory that does not exist, so realpath() fails and the
+    // canonical form equals the literal one - no alias mapping to assert.
+    const std::string pipeDir{"/tmp/ml_sandbox_arg_dir_test"};
+    const ml::sandbox::SArgDirExtraction extraction{ml::sandbox::extractArgDirs(
+        {"--logPipe=" + pipeDir + "/log.fifo", "--input=" + pipeDir + "/in.fifo"})};
+    BOOST_TEST_REQUIRE(extraction.m_RejectedPipeArgs.empty());
+    BOOST_REQUIRE_EQUAL(1, extraction.m_ArgDirs.size());
+    BOOST_REQUIRE_EQUAL(pipeDir, *extraction.m_ArgDirs.begin());
+}
+
+BOOST_AUTO_TEST_CASE(testExtractArgDirsRejectsUnmountablePaths) {
+    // A value containing a slash is a path, so a relative one is a genuine
+    // rejection rather than something to skip.
+    const ml::sandbox::SArgDirExtraction relative{
+        ml::sandbox::extractArgDirs({"--input=tmp/in.fifo"})};
+    BOOST_REQUIRE_EQUAL(1, relative.m_RejectedPipeArgs.size());
+    BOOST_TEST_REQUIRE(relative.m_RejectedPipeArgs[0].find("not absolute") !=
+                       std::string::npos);
+    BOOST_TEST_REQUIRE(relative.m_ArgDirs.empty());
+
+    // A path directly under "/" has no directory that could be bind-mounted
+    // without exposing the whole root.
+    const ml::sandbox::SArgDirExtraction rootLevel{
+        ml::sandbox::extractArgDirs({"--output=/out.fifo"})};
+    BOOST_REQUIRE_EQUAL(1, rootLevel.m_RejectedPipeArgs.size());
+    BOOST_TEST_REQUIRE(rootLevel.m_RejectedPipeArgs[0].find("no mountable directory") !=
+                       std::string::npos);
+    BOOST_TEST_REQUIRE(rootLevel.m_ArgDirs.empty());
+}
 
 #ifdef SANDBOX2_AVAILABLE
 
@@ -434,7 +502,7 @@ BOOST_AUTO_TEST_CASE(testSandbox2PytorchInferenceSpawnStartsAndTerminates) {
 
     const std::string pytorchPath = findPytorchInferenceBinary();
 
-    ml::sandbox::CSandboxedProcessSpawner spawner;
+    auto spawner = std::make_shared<ml::sandbox::CSandboxedProcessSpawner>();
     ml::sandbox::CSandboxedProcessSpawner::TStrVec args{
         "--validElasticLicenseKeyConfirmed=true",
         "--namedPipeConnectTimeout=1",
@@ -446,11 +514,11 @@ BOOST_AUTO_TEST_CASE(testSandbox2PytorchInferenceSpawnStartsAndTerminates) {
         spawner, pytorchPath, args, childPid, failureReason, std::chrono::seconds(30)));
     BOOST_TEST_REQUIRE(failureReason.empty());
     BOOST_TEST_REQUIRE(childPid > 0);
-    BOOST_TEST_REQUIRE(spawner.hasChild(childPid));
+    BOOST_TEST_REQUIRE(spawner->hasChild(childPid));
 
-    BOOST_TEST_REQUIRE(spawner.terminateChild(childPid));
-    BOOST_TEST_REQUIRE(waitForSandboxChildExit(spawner, childPid, std::chrono::seconds(5)));
-    BOOST_TEST_REQUIRE(!spawner.hasChild(childPid));
+    BOOST_TEST_REQUIRE(spawner->terminateChild(childPid));
+    BOOST_TEST_REQUIRE(waitForSandboxChildExit(*spawner, childPid, std::chrono::seconds(5)));
+    BOOST_TEST_REQUIRE(!spawner->hasChild(childPid));
 }
 
 BOOST_AUTO_TEST_CASE(testFailClosedWhenUserNamespacesUnavailable) {
@@ -460,7 +528,7 @@ BOOST_AUTO_TEST_CASE(testFailClosedWhenUserNamespacesUnavailable) {
 
     const std::string pytorchPath = findPytorchInferenceBinary();
 
-    ml::sandbox::CSandboxedProcessSpawner spawner;
+    auto spawner = std::make_shared<ml::sandbox::CSandboxedProcessSpawner>();
     ml::sandbox::CSandboxedProcessSpawner::TStrVec args{
         "--validElasticLicenseKeyConfirmed=true",
         "--namedPipeConnectTimeout=1",
@@ -473,7 +541,7 @@ BOOST_AUTO_TEST_CASE(testFailClosedWhenUserNamespacesUnavailable) {
 
     BOOST_TEST_REQUIRE(!spawned);
     BOOST_TEST_REQUIRE(childPid <= 0);
-    BOOST_TEST_REQUIRE(!spawner.hasChild(childPid));
+    BOOST_TEST_REQUIRE(!spawner->hasChild(childPid));
     BOOST_TEST_REQUIRE(failureReason.find(KILL_SWITCH_HINT) != std::string::npos);
 }
 
@@ -529,7 +597,7 @@ BOOST_AUTO_TEST_CASE(testPolicyViolationDifferential) {
     std::remove(linkPath.c_str());
     BOOST_TEST_REQUIRE(::symlink("/bin/sh", linkPath.c_str()) == 0);
 
-    ml::sandbox::CSandboxedProcessSpawner sandboxSpawner;
+    auto sandboxSpawner = std::make_shared<ml::sandbox::CSandboxedProcessSpawner>();
     ml::sandbox::CSandboxedProcessSpawner::TStrVec sandboxArgs{"-c", shellCommand};
 
     std::string failureReason;
@@ -541,7 +609,7 @@ BOOST_AUTO_TEST_CASE(testPolicyViolationDifferential) {
     BOOST_TEST_REQUIRE(failureReason.empty());
     BOOST_TEST_REQUIRE(childPid > 0);
 
-    BOOST_TEST_REQUIRE(waitForSandboxChildExit(sandboxSpawner, childPid,
+    BOOST_TEST_REQUIRE(waitForSandboxChildExit(*sandboxSpawner, childPid,
                                                std::chrono::seconds(10)));
 
     ml::core::COsFileFuncs::TStat statBuf;
