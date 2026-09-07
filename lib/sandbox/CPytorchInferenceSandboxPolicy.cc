@@ -48,21 +48,27 @@ SArgDirExtraction extractArgDirs(const std::vector<std::string>& args) {
             continue;
         }
 
-        const std::string value{arg.substr(eqPos + 1)};
+        std::string optionName{arg.substr(0, eqPos)};
+        while (optionName.empty() == false && optionName[0] == '-') {
+            optionName.erase(0, 1);
+        }
 
-        // pytorch_inference takes scalar key=value options alongside its pipe
-        // paths - --namedPipeConnectTimeout=1, --numAllocations=2,
-        // --validElasticLicenseKeyConfirmed=true - and the pipe options cannot
-        // be told apart by name, since --input, --output and --restore carry
-        // paths while --inputIsPipe and friends are bare flags. A value with no
-        // '/' in it therefore cannot be a pipe path, and is skipped silently
-        // rather than recorded as rejected. Operators are told to expect
-        // rejectedPipeArgs to be empty when triaging FIFO problems, so listing
-        // every scalar option there would make the signal useless.
-        if (value.find('/') == std::string::npos) {
+        const bool isPathOption =
+            optionName == "input" || optionName == "output" || optionName == "restore" ||
+            optionName == "logPipe";
+        if (isPathOption == false) {
             continue;
         }
 
+        const std::string value{arg.substr(eqPos + 1)};
+
+        // pytorch_inference exposes exactly four path-bearing options (input,
+        // output, restore, logPipe); every other key=value option is a scalar
+        // and is skipped by name without inspecting its value. Bare flags such
+        // as --inputIsPipe have no '=' and are skipped earlier. Only the four
+        // path options can land in rejectedPipeArgs, so operators can treat an
+        // empty rejectedPipeArgs list as a healthy spawn when triaging FIFO
+        // problems.
         if (value[0] != '/') {
             extraction.m_RejectedPipeArgs.push_back(arg + " (path not absolute)");
             continue;

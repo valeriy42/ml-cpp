@@ -442,13 +442,13 @@ bool spawnSandboxedWithTimeout(const std::shared_ptr<ml::sandbox::CSandboxedProc
 
 // Independent of Sandbox2 availability: pure argument classification.
 BOOST_AUTO_TEST_CASE(testExtractArgDirsIgnoresScalarOptions) {
-    // Every option pytorch_inference actually receives alongside its pipes.
-    // None of these is a path, so none of them belongs in rejectedPipeArgs -
-    // operators are told to expect that list empty when triaging FIFO problems.
+    // Scalar options are skipped by name; absolute-looking values on scalars
+    // must not grant a mount or appear in rejectedPipeArgs.
     const ml::sandbox::SArgDirExtraction scalars{ml::sandbox::extractArgDirs(
         {"--validElasticLicenseKeyConfirmed=true", "--namedPipeConnectTimeout=1",
          "--numThreadsPerAllocation=2", "--numAllocations=1",
-         "--cacheMemorylimitBytes=1048576", "--modelid=my-model", "--inputIsPipe"})};
+         "--cacheMemorylimitBytes=1048576", "--modelid=my-model", "--inputIsPipe",
+         "--modelid=/etc/passwd"})};
     BOOST_TEST_REQUIRE(scalars.m_RejectedPipeArgs.empty());
     BOOST_TEST_REQUIRE(scalars.m_ArgDirs.empty());
     BOOST_TEST_REQUIRE(scalars.m_PipeDirAliasMappings.empty());
@@ -466,8 +466,14 @@ BOOST_AUTO_TEST_CASE(testExtractArgDirsMountsAbsolutePipeDirectories) {
 }
 
 BOOST_AUTO_TEST_CASE(testExtractArgDirsRejectsUnmountablePaths) {
-    // A value containing a slash is a path, so a relative one is a genuine
-    // rejection rather than something to skip.
+    // Path-bearing options with non-absolute values are rejected, not skipped.
+    const ml::sandbox::SArgDirExtraction noSlash{
+        ml::sandbox::extractArgDirs({"--input=in.fifo"})};
+    BOOST_REQUIRE_EQUAL(1, noSlash.m_RejectedPipeArgs.size());
+    BOOST_TEST_REQUIRE(noSlash.m_RejectedPipeArgs[0].find("not absolute") !=
+                       std::string::npos);
+    BOOST_TEST_REQUIRE(noSlash.m_ArgDirs.empty());
+
     const ml::sandbox::SArgDirExtraction relative{
         ml::sandbox::extractArgDirs({"--input=tmp/in.fifo"})};
     BOOST_REQUIRE_EQUAL(1, relative.m_RejectedPipeArgs.size());
