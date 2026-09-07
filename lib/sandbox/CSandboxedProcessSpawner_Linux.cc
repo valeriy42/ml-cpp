@@ -261,8 +261,6 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
         return false;
     }
 
-    LOG_INFO(<< "Spawned sandboxed pytorch_inference with PID " << childPid);
-
     auto sandbox = std::shared_ptr<sandbox2::Sandbox2>(std::move(sandboxPtr));
     const int pidFd =
         static_cast<int>(::syscall(ML_NR_pidfd_open, static_cast<pid_t>(childPid), 0u));
@@ -322,8 +320,11 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
                                  std::string{e.what()} + SANDBOX2_DISABLE_HINT};
         LOG_ERROR(<< reason);
         assignFailureReason(failureReason, reason);
+        childPid = 0;
         return false;
     }
+
+    LOG_INFO(<< "Spawned sandboxed pytorch_inference with PID " << childPid);
 
     return true;
 #else
