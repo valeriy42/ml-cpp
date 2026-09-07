@@ -54,6 +54,96 @@ void assignFailureReason(std::string* failureReason, const std::string& reason) 
 
 namespace ml {
 namespace sandbox {
+namespace {
+
+#ifdef SANDBOX2_AVAILABLE
+
+//! The sandboxee's environment: the caller's, with ML_SANDBOXED=1 set exactly
+//! once so pytorch_inference skips its in-process seccomp filter and relies on
+//! the Sandbox2 policy instead.
+std::vector<std::string> buildSandboxeeEnvironment() {
+    std::vector<std::string> sandboxeeEnv;
+    bool markerSet{false};
+    for (char** env = environ; *env != nullptr; ++env) {
+        std::string envVar{*env};
+        if (envVar.find("ML_SANDBOXED=") == 0) {
+            sandboxeeEnv.push_back("ML_SANDBOXED=1");
+            markerSet = true;
+        } else {
+            sandboxeeEnv.push_back(std::move(envVar));
+        }
+    }
+    if (markerSet == false) {
+        sandboxeeEnv.push_back("ML_SANDBOXED=1");
+    }
+    return sandboxeeEnv;
+}
+
+//! An executor configured for a long-lived daemon sandboxee.
+std::unique_ptr<sandbox2::Executor>
+makeConfiguredExecutor(const std::string& absPath,
+                       const std::vector<std::string>& fullArgs,
+                       const std::string& binDir) {
+    auto executor = std::make_unique<sandbox2::Executor>(
+        absPath, fullArgs, buildSandboxeeEnvironment());
+
+    // Apply sandbox before exec since pytorch_inference doesn't use Sandbox2 client library
+    executor->set_enable_sandbox_before_exec(true);
+    executor->set_cwd(binDir);
+    // pytorch_inference is a long-lived daemon that stays up for the whole
+    // lifetime of a deployed model, not a run-to-completion sandboxee.
+    // Sandbox2 defaults to a 120s wall-time limit and a 1024s CPU-time
+    // limit, either of which would kill a healthy inference process (and
+    // did, with Result::TIMEOUT, on the QA clusters). Disarm both.
+    executor->limits()->set_walltime_limit(absl::ZeroDuration());
+    executor->limits()->set_rlimit_cpu(RLIM64_INFINITY);
+    // Sandbox2 defaults to rlimit_nofile=1024; libtorch thread pools and pipe I/O
+    // under concurrent inference can approach that on QA clusters.
+    executor->limits()->set_rlimit_nofile(65536);
+    return executor;
+}
+
+//! Log how a sandboxed pytorch_inference terminated.
+//!
+//! Runs on the monitor thread that owns the sandbox instance, so it deliberately
+//! takes no spawner state - the caller does the PID bookkeeping under the lock.
+void logSandboxeeTermination(core::CProcess::TPid sandboxPid, const sandbox2::Result& result) {
+    switch (result.final_status()) {
+    case sandbox2::Result::OK:
+        if (result.reason_code() == 0) {
+            LOG_DEBUG(<< "Sandboxed pytorch_inference (PID " << sandboxPid << ") has exited");
+        } else {
+            LOG_WARN(<< "Sandboxed pytorch_inference (PID " << sandboxPid
+                     << ") has exited with exit code " << result.reason_code());
+        }
+        break;
+    case sandbox2::Result::SIGNALED:
+        if (result.reason_code() == SIGTERM) {
+            LOG_INFO(<< "Sandboxed pytorch_inference (PID " << sandboxPid
+                     << ") was terminated by signal " << SIGTERM);
+        } else if (result.reason_code() == SIGKILL) {
+            LOG_ERROR(<< "Sandboxed pytorch_inference (PID " << sandboxPid << ") was terminated by signal 9 (SIGKILL)."
+                      << " This is likely due to the OOM killer.");
+        } else {
+            LOG_ERROR(<< "Sandboxed pytorch_inference (PID " << sandboxPid
+                      << ") was terminated by signal " << result.reason_code());
+        }
+        break;
+    default:
+        LOG_ERROR(<< "Sandboxed pytorch_inference (PID " << sandboxPid
+                  << ") terminated abnormally: " << formatSandbox2Result(result));
+        if (result.final_status() == sandbox2::Result::VIOLATION) {
+            LOG_ERROR(<< "Sandboxed pytorch_inference (PID " << sandboxPid
+                      << ") seccomp violation: syscall=" << result.reason_code()
+                      << " arch=" << sandboxPlatformArch());
+        }
+        break;
+    }
+}
+
+#endif // SANDBOX2_AVAILABLE
+
+} // namespace
 
 CSandboxedProcessSpawner::CSandboxedProcessSpawner() = default;
 
@@ -90,13 +180,16 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
     std::vector<std::string> fullArgs;
     fullArgs.reserve(args.size() + 1);
     fullArgs.push_back(processPath);
-    for (const auto& arg : args) {
+    for (const std::string& arg : args) {
         fullArgs.push_back(arg);
     }
 
-    // Get binary and library directories
-    std::string binDir = absPath.substr(0, absPath.rfind('/'));
-    std::string libDir = binDir.substr(0, binDir.rfind('/')) + "/lib";
+    // Binary and library directories to bind-mount. Note that libDir is the
+    // SIBLING of binDir, not a child of it: the ML distribution lays out
+    // <install>/bin/pytorch_inference alongside <install>/lib, so this strips
+    // "bin" off binDir before appending "lib" rather than appending to binDir.
+    const std::string binDir{absPath.substr(0, absPath.rfind('/'))};
+    const std::string libDir{binDir.substr(0, binDir.rfind('/')) + "/lib"};
 
     // Extract directories from command-line arguments for pipe paths
     const SArgDirExtraction argDirInfo{extractArgDirs(args)};
@@ -116,43 +209,10 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
         return false;
     }
 
-    // Create executor with a sandbox marker.
-    std::vector<std::string> customEnv;
-    bool sandboxMarkerSet{false};
-    for (char** env = environ; *env != nullptr; ++env) {
-        std::string envVar(*env);
-        if (envVar.find("ML_SANDBOXED=") == 0) {
-            customEnv.push_back("ML_SANDBOXED=1");
-            sandboxMarkerSet = true;
-        } else {
-            customEnv.push_back(envVar);
-        }
-    }
-    if (!sandboxMarkerSet) {
-        customEnv.push_back("ML_SANDBOXED=1");
-    }
-
     logSandbox2SpawnContext(absPath, binDir, libDir, argDirInfo);
 
-    std::unique_ptr<sandbox2::Executor> executor =
-        std::make_unique<sandbox2::Executor>(absPath, fullArgs, customEnv);
-
-    // Apply sandbox before exec since pytorch_inference doesn't use Sandbox2 client library
-    executor->set_enable_sandbox_before_exec(true);
-    executor->set_cwd(binDir);
-    // pytorch_inference is a long-lived daemon that stays up for the whole
-    // lifetime of a deployed model, not a run-to-completion sandboxee.
-    // Sandbox2 defaults to a 120s wall-time limit and a 1024s CPU-time
-    // limit, either of which would kill a healthy inference process (and
-    // did, with Result::TIMEOUT, on the QA clusters). Disarm both.
-    executor->limits()->set_walltime_limit(absl::ZeroDuration());
-    executor->limits()->set_rlimit_cpu(RLIM64_INFINITY);
-    // Sandbox2 defaults to rlimit_nofile=1024; libtorch thread pools and pipe I/O
-    // under concurrent inference can approach that on QA clusters.
-    executor->limits()->set_rlimit_nofile(65536);
-
-    auto sandboxPtr = std::make_unique<sandbox2::Sandbox2>(std::move(executor),
-                                                           std::move(*policyResult));
+    auto sandboxPtr = std::make_unique<sandbox2::Sandbox2>(
+        makeConfiguredExecutor(absPath, fullArgs, binDir), std::move(*policyResult));
 
     if (!sandboxPtr->RunAsync()) {
         sandbox2::Result result{sandboxPtr->AwaitResult()};
@@ -187,54 +247,14 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
     // pytorch_inference, waits for its result, logs termination, and removes
     // the PID from the tracker so PID reuse cannot make terminateChild()
     // signal an unrelated process.
-    {
-        core::CProcess::TPid sandboxPid{childPid};
-        CSandboxedProcessSpawner* self = this;
-        std::thread(
-            [ sandboxPid, self, sbx = std::move(sandboxPtr) ]() mutable {
-                sandbox2::Result result{sbx->AwaitResult()};
-                switch (result.final_status()) {
-                case sandbox2::Result::OK:
-                    if (result.reason_code() == 0) {
-                        LOG_DEBUG(<< "Sandboxed pytorch_inference (PID "
-                                  << sandboxPid << ") has exited");
-                    } else {
-                        LOG_WARN(<< "Sandboxed pytorch_inference (PID "
-                                 << sandboxPid << ") has exited with exit code "
-                                 << result.reason_code());
-                    }
-                    break;
-                case sandbox2::Result::SIGNALED:
-                    if (result.reason_code() == SIGTERM) {
-                        LOG_INFO(<< "Sandboxed pytorch_inference (PID " << sandboxPid
-                                 << ") was terminated by signal " << SIGTERM);
-                    } else if (result.reason_code() == SIGKILL) {
-                        LOG_ERROR(<< "Sandboxed pytorch_inference (PID " << sandboxPid
-                                  << ") was terminated by signal 9 (SIGKILL)."
-                                  << " This is likely due to the OOM killer.");
-                    } else {
-                        LOG_ERROR(<< "Sandboxed pytorch_inference (PID "
-                                  << sandboxPid << ") was terminated by signal "
-                                  << result.reason_code());
-                    }
-                    break;
-                default: {
-                    const std::string details{formatSandbox2Result(result)};
-                    LOG_ERROR(<< "Sandboxed pytorch_inference (PID " << sandboxPid
-                              << ") terminated abnormally: " << details);
-                    if (result.final_status() == sandbox2::Result::VIOLATION) {
-                        LOG_ERROR(<< "Sandboxed pytorch_inference (PID " << sandboxPid
-                                  << ") seccomp violation: syscall=" << result.reason_code()
-                                  << " arch=" << sandboxPlatformArch());
-                    }
-                    break;
-                }
-                }
-                std::lock_guard<std::mutex> lock(self->m_Mutex);
-                self->m_Pids.erase(sandboxPid);
-            })
-            .detach();
-    }
+    const core::CProcess::TPid sandboxPid{childPid};
+    CSandboxedProcessSpawner* self{this};
+    std::thread([ sandboxPid, self, sbx = std::move(sandboxPtr) ]() mutable {
+        logSandboxeeTermination(sandboxPid, sbx->AwaitResult());
+        std::lock_guard<std::mutex> lock(self->m_Mutex);
+        self->m_Pids.erase(sandboxPid);
+    })
+        .detach();
 
     return true;
 #else
