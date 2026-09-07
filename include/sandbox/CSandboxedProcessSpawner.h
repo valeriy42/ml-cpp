@@ -14,11 +14,16 @@
 #include <core/CProcess.h>
 #include <sandbox/ImportExport.h>
 
+#include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <string>
 #include <vector>
+
+namespace sandbox2 {
+class Sandbox2;
+}
 
 namespace ml {
 namespace sandbox {
@@ -54,21 +59,31 @@ public:
     bool hasChild(core::CProcess::TPid pid) const;
 
 private:
-    using TPidSet = std::set<core::CProcess::TPid>;
+    //! \brief A live sandboxed child and the handles needed to manage it safely.
+    struct SSandboxedChild {
+        std::uint64_t s_Generation{0};
+        std::shared_ptr<sandbox2::Sandbox2> s_Sandbox;
+        int s_PidFd{-1};
+    };
 
-    //! \brief The set of live sandboxed PIDs, and the lock that guards it.
+    //! \brief The live sandboxed children, and the lock that guards them.
     //!
     //! DESCRIPTION:\n
-    //! Held behind a shared_ptr because the monitor thread that removes a PID
+    //! Held behind a shared_ptr because the monitor thread that removes a child
     //! outlives the spawn() call that started it, and can outlive this object:
     //! the controller may tear the spawner down while a sandboxed
     //! pytorch_inference is still running, and the monitor only learns that the
     //! sandboxee exited some time later. A raw pointer back to the spawner
-    //! would be dangling by then, so the monitor co-owns the registry instead
-    //! and the spawner needs no synchronisation in its destructor.
+    //! would be dangling by then, so the monitor co-owns the registry and a
+    //! shared_ptr to the Sandbox2 instance instead, and the spawner needs no
+    //! synchronisation in its destructor. Each entry carries a monotonic
+    //! generation so a stale monitor cannot erase a re-registered PID, and a
+    //! pidfd (when the kernel provides one) so terminateChild() can signal the
+    //! exact process even after the PID has been reused.
     struct SPidRegistry {
         mutable std::mutex s_Mutex;
-        TPidSet s_Pids;
+        std::uint64_t s_NextGeneration{0};
+        std::map<core::CProcess::TPid, SSandboxedChild> s_Children;
     };
     using TPidRegistryPtr = std::shared_ptr<SPidRegistry>;
 

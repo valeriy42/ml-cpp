@@ -16,6 +16,7 @@
 
 #include <memory>
 #include <sstream>
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -26,7 +27,25 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+
+// The CentOS 7 based CI build image has kernel headers that predate pidfd, so
+// __NR_pidfd_open / __NR_pidfd_send_signal may be undefined at build time even
+// though the runtime kernel supports them. Both syscalls are 434/424 on every
+// architecture we build for (x86_64 and aarch64), so fall back to those
+// literals to keep the controller independent of the build image's header
+// version.
+#ifdef __NR_pidfd_open
+#define ML_NR_pidfd_open __NR_pidfd_open
+#else
+#define ML_NR_pidfd_open 434
+#endif
+#ifdef __NR_pidfd_send_signal
+#define ML_NR_pidfd_send_signal __NR_pidfd_send_signal
+#else
+#define ML_NR_pidfd_send_signal 424
+#endif
 
 extern char** environ;
 
@@ -49,6 +68,14 @@ void assignFailureReason(std::string* failureReason, const std::string& reason) 
         *failureReason = reason;
     }
 }
+
+#ifdef SANDBOX2_AVAILABLE
+void closePidFdIfOpen(int pidFd) {
+    if (pidFd >= 0) {
+        ::close(pidFd);
+    }
+}
+#endif // SANDBOX2_AVAILABLE
 
 } // namespace
 
@@ -236,30 +263,67 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
 
     LOG_INFO(<< "Spawned sandboxed pytorch_inference with PID " << childPid);
 
+    auto sandbox = std::shared_ptr<sandbox2::Sandbox2>(std::move(sandboxPtr));
+    const int pidFd =
+        static_cast<int>(::syscall(ML_NR_pidfd_open, static_cast<pid_t>(childPid), 0u));
+
+    const core::CProcess::TPid sandboxPid{childPid};
+    std::uint64_t generation{0};
     {
         std::lock_guard<std::mutex> lock(m_PidRegistry->s_Mutex);
-        m_PidRegistry->s_Pids.insert(childPid);
+        generation = ++m_PidRegistry->s_NextGeneration;
+        m_PidRegistry->s_Children[sandboxPid] = {generation, sandbox, pidFd};
     }
 
     // The sandboxee is a child of the Sandbox2 forkserver rather than of the
     // controller, so waitpid() never sees it. Own the sandbox instance on a
     // dedicated thread that keeps it alive for the lifetime of
-    // pytorch_inference, waits for its result, logs termination, and removes
-    // the PID from the registry so PID reuse cannot make terminateChild()
-    // signal an unrelated process.
+    // pytorch_inference, waits for its result, and removes the registry entry
+    // before logging termination.
     //
-    // The thread co-owns the registry rather than capturing this: it can still
-    // be waiting on a live sandboxee when the spawner is destroyed, and a raw
-    // pointer would be dangling by the time the sandboxee exits.
-    const core::CProcess::TPid sandboxPid{childPid};
-    std::thread([
-        sandboxPid, registry = m_PidRegistry, sbx = std::move(sandboxPtr)
-    ]() mutable {
-        logSandboxeeTermination(sandboxPid, sbx->AwaitResult());
-        std::lock_guard<std::mutex> lock(registry->s_Mutex);
-        registry->s_Pids.erase(sandboxPid);
-    })
-        .detach();
+    // Each entry carries a monotonic generation so a stale monitor cannot erase
+    // a re-registered PID after AwaitResult() reaps the process. terminateChild()
+    // signals via pidfd when available so it targets the exact process even if
+    // the numeric PID has been reused; on kernels <5.3 where pidfd_open returns
+    // -1/ENOSYS the ::kill fallback retains a bounded residual window where a
+    // recycled PID could be signalled.
+    //
+    // The thread co-owns the registry and the Sandbox2 shared_ptr rather than
+    // capturing this: it can still be waiting on a live sandboxee when the
+    // spawner is destroyed, and a raw pointer would be dangling by the time the
+    // sandboxee exits.
+    try {
+        std::thread([sandboxPid, registry = m_PidRegistry, sandbox, generation]() {
+            const sandbox2::Result result{sandbox->AwaitResult()};
+            {
+                std::lock_guard<std::mutex> lock(registry->s_Mutex);
+                const auto it = registry->s_Children.find(sandboxPid);
+                if (it != registry->s_Children.end() &&
+                    it->second.s_Generation == generation) {
+                    closePidFdIfOpen(it->second.s_PidFd);
+                    registry->s_Children.erase(it);
+                }
+            }
+            logSandboxeeTermination(sandboxPid, result);
+        }).detach();
+    } catch (const std::system_error& e) {
+        {
+            std::lock_guard<std::mutex> lock(m_PidRegistry->s_Mutex);
+            const auto it = m_PidRegistry->s_Children.find(sandboxPid);
+            if (it != m_PidRegistry->s_Children.end() &&
+                it->second.s_Generation == generation) {
+                closePidFdIfOpen(it->second.s_PidFd);
+                m_PidRegistry->s_Children.erase(it);
+            }
+        }
+        sandbox->Kill();
+        sandbox->AwaitResult();
+        const std::string reason{"Failed to start Sandbox2 monitor thread: " +
+                                 std::string{e.what()} + SANDBOX2_DISABLE_HINT};
+        LOG_ERROR(<< reason);
+        assignFailureReason(failureReason, reason);
+        return false;
+    }
 
     return true;
 #else
@@ -274,10 +338,23 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
 
 bool CSandboxedProcessSpawner::terminateChild(core::CProcess::TPid pid) {
     std::lock_guard<std::mutex> lock(m_PidRegistry->s_Mutex);
-    if (m_PidRegistry->s_Pids.find(pid) == m_PidRegistry->s_Pids.end()) {
+    const auto it = m_PidRegistry->s_Children.find(pid);
+    if (it == m_PidRegistry->s_Children.end()) {
         LOG_WARN(<< "Will not attempt to kill sandboxed process " << pid
                  << ": not a child process");
         return false;
+    }
+
+    const int pidFd = it->second.s_PidFd;
+    if (pidFd >= 0) {
+        if (::syscall(ML_NR_pidfd_send_signal, pidFd, SIGTERM, nullptr, 0u) == -1) {
+            if (errno != ESRCH) {
+                LOG_ERROR(<< "Failed to kill sandboxed process " << pid << ": "
+                          << ::strerror(errno));
+            }
+            return false;
+        }
+        return true;
     }
 
     if (::kill(pid, SIGTERM) == -1) {
@@ -297,7 +374,7 @@ bool CSandboxedProcessSpawner::hasChild(core::CProcess::TPid pid) const {
     }
 
     std::lock_guard<std::mutex> lock(m_PidRegistry->s_Mutex);
-    return m_PidRegistry->s_Pids.find(pid) != m_PidRegistry->s_Pids.end();
+    return m_PidRegistry->s_Children.find(pid) != m_PidRegistry->s_Children.end();
 }
 
 } // namespace sandbox
