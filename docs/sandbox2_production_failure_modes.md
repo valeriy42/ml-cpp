@@ -120,16 +120,41 @@ measured by `diagnose_userns.sh`:
 | runner | probe | covers |
 |---|---|---|
 | host | all stages OK | `enforced` — **pinned** in `run_tests.sh` |
-| docker, default | denied at `unshare(CLONE_NEWUSER)` | `fail_closed` |
+| host, inside a namespace with `user.max_user_namespaces=0` | denied at `unshare(CLONE_NEWUSER)` | `fail_closed` — **pinned** |
+| docker, default | denied at `unshare(CLONE_NEWUSER)` | not load-bearing |
 | docker + `seccomp=unconfined` | denied at `mount(proc)`, masked `/proc` paths | — |
 | docker + `seccomp` + `systempaths=unconfined` | all stages OK | — |
 | docker `--privileged` | all stages OK | — |
 
-Both modes are therefore covered on one agent, and the enforced half needs no
-privilege escalation: the host runner suffices. The container run is left
-unpinned on purpose — it supplies the fail-closed half, and if a Docker upgrade
-ever permits `CLONE_NEWUSER` it will simply cover enforced instead, while the
-host pin still guarantees enforced coverage exists.
+Both modes are pinned, on the host, so neither can stop executing without
+failing the build. The enforced half needs no privilege escalation at all.
+
+The fail-closed half runs inside a user namespace whose
+`user.max_user_namespaces` has been set to 0. That sysctl is per-user-namespace,
+so exhausting it in a namespace we own denies every further user namespace in
+that subtree — `clone(CLONE_NEWUSER)`, which is what Sandbox2 uses, as well as
+`unshare(CLONE_NEWUSER)`, which is what the test's probe uses. Both then fail
+with `ENOSPC`. This deliberately does not use a seccomp profile: a profile
+denying only `unshare(2)` would leave `clone(CLONE_NEWUSER)` working, so the
+probe would report a capability Sandbox2 does not have, and filtering
+`clone`'s flags argument correctly is architecture-specific. Nothing about
+coverage therefore depends on Docker's default seccomp profile continuing to
+deny `CLONE_NEWUSER`.
+
+### Known gap: filesystem policy is not yet differentially tested
+
+`testPolicyViolationDifferential` proves that a binary which is not
+`pytorch_inference` is stopped by the **syscall** policy during its own startup
+— the shell it nominates calls `getpgid`, which the allowlist does not permit.
+It asserts that explicitly, via a sentinel under `/tmp` (a directory the policy
+*does* mount read-write) which the payload never reaches.
+
+What is still untested is the **filesystem** policy: that a payload which
+survives the allowlist cannot write outside its mounts. Testing that needs a
+payload whose syscalls all fall inside the pytorch_inference allowlist, so a
+purpose-built helper rather than a shell. Adding `getpgid` to the allowlist to
+make a shell survive is not an option — that would weaken the production policy
+to suit a test.
 
 **Diagnosing a runner.** The suite logs, once per run:
 

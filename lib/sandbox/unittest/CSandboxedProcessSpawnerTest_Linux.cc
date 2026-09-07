@@ -485,17 +485,30 @@ BOOST_AUTO_TEST_CASE(testPolicyViolationDifferential) {
     const std::string testDir = makeTestDir();
     ::mkdir(testDir.c_str(), 0700);
 
-    // Use a path outside every Sandbox2 mount. $HOME is never bind-mounted for
-    // pytorch_inference, while /tmp and the fixed system paths are.
+    // Two paths, and the distinction is what gives this test its teeth:
+    //
+    //  - sentinelPath is under /tmp, which the policy DOES bind-mount rw, so a
+    //    sandboxed payload that reaches its command list can create it.
+    //  - forbiddenPath is under $HOME, which is never mounted for
+    //    pytorch_inference, so no sandboxed payload can create it.
+    //
+    // Asserting only that forbiddenPath is absent would pass even if the payload
+    // were killed before running anything at all - which is exactly what happens
+    // here, and what this test therefore pins down explicitly.
     const char* homeDir = ::getenv("HOME");
     BOOST_TEST_REQUIRE(homeDir != nullptr);
-    const std::string forbiddenPath{std::string{homeDir} + "/.ml_sandbox_violation_" +
-                                    ml::core::CStringUtils::typeToString(::getpid())};
+    const std::string pidSuffix{ml::core::CStringUtils::typeToString(::getpid())};
+    const std::string forbiddenPath{std::string{homeDir} + "/.ml_sandbox_violation_" + pidSuffix};
+    const std::string sentinelPath{testDir + "/reached_command_list_" + pidSuffix};
     std::remove(forbiddenPath.c_str());
+    std::remove(sentinelPath.c_str());
 
-    const std::string shellCommand{"touch " + forbiddenPath};
+    // The sentinel comes first, so its presence means the payload ran and its
+    // absence means the payload never got that far.
+    const std::string shellCommand{"touch " + sentinelPath + "; touch " + forbiddenPath};
 
-    // Positive control: unsandboxed /bin/sh can write outside sandbox mounts.
+    // Positive control: unsandboxed /bin/sh reaches its command list and writes
+    // both paths, proving the payload and both paths are otherwise viable.
     {
         ml::core::CDetachedProcessSpawner::TStrVec permittedPaths{"/bin/sh"};
         ml::core::CDetachedProcessSpawner legacySpawner{permittedPaths};
@@ -505,11 +518,13 @@ BOOST_AUTO_TEST_CASE(testPolicyViolationDifferential) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
         ml::core::COsFileFuncs::TStat statBuf;
+        BOOST_REQUIRE_EQUAL(0, ml::core::COsFileFuncs::stat(sentinelPath.c_str(), &statBuf));
         BOOST_REQUIRE_EQUAL(0, ml::core::COsFileFuncs::stat(forbiddenPath.c_str(), &statBuf));
+        std::remove(sentinelPath.c_str());
         std::remove(forbiddenPath.c_str());
     }
 
-    // Sandboxed path: same write attempt must be blocked by filesystem policy.
+    // Sandboxed path: the same shell nominated as pytorch_inference.
     const std::string linkPath{testDir + "/pytorch_inference"};
     std::remove(linkPath.c_str());
     BOOST_TEST_REQUIRE(::symlink("/bin/sh", linkPath.c_str()) == 0);
@@ -530,9 +545,20 @@ BOOST_AUTO_TEST_CASE(testPolicyViolationDifferential) {
                                                std::chrono::seconds(10)));
 
     ml::core::COsFileFuncs::TStat statBuf;
+
+    // The shell is stopped by the syscall policy during its own startup - it
+    // calls getpgid, which the pytorch_inference allowlist does not permit - so
+    // it never reaches even the writable sentinel. Assert that, rather than
+    // leaving it as an unstated assumption: if Sandbox2 ever lets a foreign
+    // binary start, the sentinel appears and this test fails, which is the
+    // signal that filesystem-policy coverage needs a payload that survives the
+    // allowlist. See the follow-up noted in
+    // docs/sandbox2_production_failure_modes.md.
+    BOOST_REQUIRE_NE(0, ml::core::COsFileFuncs::stat(sentinelPath.c_str(), &statBuf));
     BOOST_REQUIRE_NE(0, ml::core::COsFileFuncs::stat(forbiddenPath.c_str(), &statBuf));
 
     std::remove(linkPath.c_str());
+    std::remove(sentinelPath.c_str());
     ::rmdir(testDir.c_str());
 }
 
