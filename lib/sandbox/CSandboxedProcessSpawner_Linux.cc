@@ -14,9 +14,9 @@
 #include <sandbox/CPytorchInferenceSandboxPolicy.h>
 #include <sandbox/CSandbox2Diagnostics.h>
 
+#include <exception>
 #include <memory>
 #include <sstream>
-#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -270,6 +270,12 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
     {
         std::lock_guard<std::mutex> lock(m_PidRegistry->s_Mutex);
         generation = ++m_PidRegistry->s_NextGeneration;
+        const auto existing = m_PidRegistry->s_Children.find(sandboxPid);
+        if (existing != m_PidRegistry->s_Children.end()) {
+            closePidFdIfOpen(existing->second.s_PidFd);
+            LOG_DEBUG(<< "Replacing stale registry entry for sandboxed pytorch_inference PID "
+                      << sandboxPid << " before registering generation " << generation);
+        }
         m_PidRegistry->s_Children[sandboxPid] = {generation, sandbox, pidFd};
     }
 
@@ -304,7 +310,7 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
             }
             logSandboxeeTermination(sandboxPid, result);
         }).detach();
-    } catch (const std::system_error& e) {
+    } catch (const std::exception& e) {
         {
             std::lock_guard<std::mutex> lock(m_PidRegistry->s_Mutex);
             const auto it = m_PidRegistry->s_Children.find(sandboxPid);
