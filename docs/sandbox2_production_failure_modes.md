@@ -43,10 +43,12 @@ confirm `pipeDirs` contains the ES temp directory, `rejectedPipeArgs` is empty, 
 `pipeDirAliases` shows any symlink double-mounts. Compare literal vs canonical pipe
 directory paths.
 
-`rejectedPipeArgs` lists only arguments whose value looks like a path — that is,
-contains a `/` — but which cannot be mounted. Scalar options such as
-`--namedPipeConnectTimeout=1` are not paths and are skipped silently, so the
-list really should be empty in a healthy spawn.
+`rejectedPipeArgs` lists only the four path-bearing options — `--input`,
+`--output`, `--restore` and `--logPipe` — whose value cannot be mounted. Every
+other `key=value` option is scalar and is skipped by name, without its value
+being inspected at all, so an empty `rejectedPipeArgs` really does mean a
+healthy spawn. A path option carrying a relative value, such as `--input=foo`,
+is reported rather than skipped.
 
 ### Seccomp policy violation (SIGSYS)
 
