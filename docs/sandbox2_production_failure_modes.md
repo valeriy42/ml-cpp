@@ -109,8 +109,11 @@ a probe of what the runner's kernel actually permits:
 
 | mode | requires | covers |
 |---|---|---|
-| `enforced` | user namespaces available | real sandboxed spawn/terminate, filesystem-policy differential |
+| `enforced` | user namespaces available | real sandboxed spawn/terminate, syscall-policy differential |
 | `fail_closed` | user namespaces unavailable | spawn refusal, kill-switch hint in the failure reason |
+
+The `enforced` differential covers syscall policy only; filesystem-policy
+differential coverage remains a known gap (see below).
 
 The allowlist drift check is mode independent and always runs.
 
