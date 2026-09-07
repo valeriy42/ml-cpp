@@ -82,13 +82,14 @@ if [[ "$HARDWARE_ARCH" = aarch64 && -z "${CPP_CROSS_COMPILE:-}" && "$(uname)" = 
     # kernel, so the kernel's seccomp filters are exercised without needing
     # a separate outside-Docker run.
     #
-    # The container above is left unpinned deliberately. Docker's default seccomp
-    # profile denies unshare(CLONE_NEWUSER), so the sandbox tests select
-    # fail-closed coverage there - which is coverage we want, and which no other
-    # runner on this agent provides.
+    # The container's sandbox tests are not load-bearing for coverage: both modes
+    # are pinned on the host below, so whichever mode the container happens to
+    # select is a bonus. Coverage therefore does not depend on Docker's default
+    # seccomp profile continuing to deny unshare(CLONE_NEWUSER).
 
-    # The host is the runner that can do the other half. Measured by
-    # diagnose_userns.sh on this agent (core-almalinux-8-aarch64, kernel 4.18):
+    # Both coverage modes run on the host, each pinned, so neither can quietly
+    # stop executing. Measured by diagnose_userns.sh on this agent
+    # (core-almalinux-8-aarch64, kernel 4.18):
     #
     #   host                             all stages OK
     #   docker (default)                 denied at unshare(CLONE_NEWUSER)
@@ -96,30 +97,49 @@ if [[ "$HARDWARE_ARCH" = aarch64 && -z "${CPP_CROSS_COMPILE:-}" && "$(uname)" = 
     #   docker + seccomp + systempaths   all stages OK
     #   docker --privileged              all stages OK
     #
-    # The host needs no privilege escalation at all, so it is where the enforced
-    # coverage belongs. Pinned, because these two test cases - a real sandboxed
-    # spawn and the filesystem-policy differential - are the security-critical
-    # ones, and a silent downgrade to fail-closed coverage must fail the build
-    # rather than pass quietly. Runs against the bundled gcc133 sysroot so the
-    # binary does not resolve against AlmaLinux 8 /lib64.
+    # The host needs no privilege escalation for the enforced half. Runs against
+    # the bundled gcc133 sysroot so the binary does not resolve against
+    # AlmaLinux 8 /lib64.
     if [[ $TEST_OUTCOME -eq 0 ]]; then
-        echo "--- Re-running sandbox unit tests on host (enforced)"
         REPO_ROOT_ABS="$(pwd)"
         SYSROOT="$(pwd)/${BUILD_DIR}/lib/sysroot"
         LIB_DIRS=$(find "$(pwd)/${BUILD_DIR}/lib" "$(pwd)/build/distribution" \
             \( -name "*.so" -o -name "*.so.*" \) \
             -exec dirname {} \; 2>/dev/null | sort -u | tr '\n' ':')
+        SANDBOX_TEST_DIR="${REPO_ROOT_ABS}/${BUILD_DIR}/test/lib/sandbox/unittest"
         # CPP_SRC_HOME must be set: CResourceLocator::cppRootDir() otherwise
         # falls back to "../../.." on the assumption that the cwd is a source
         # unittest directory, whereas this runs from the build tree - so the
         # spawn test looked for pytorch_inference under cmake-build-docker/ and
         # did not find it. set_env.sh exports it inside the container; nothing
         # does on the host.
-        (cd "${REPO_ROOT_ABS}/${BUILD_DIR}/test/lib/sandbox/unittest" && \
-            CPP_SRC_HOME="${REPO_ROOT_ABS}" \
+        export CPP_SRC_HOME="${REPO_ROOT_ABS}"
+        export LD_LIBRARY_PATH="${SYSROOT}:${LIB_DIRS}"
+
+        echo "--- Re-running sandbox unit tests on host (enforced)"
+        (cd "${SANDBOX_TEST_DIR}" && \
             ML_SANDBOX2_REQUIRE="${ML_SANDBOX2_HOST_REQUIRE:-enforced}" \
-            LD_LIBRARY_PATH="${SYSROOT}:${LIB_DIRS}" \
             ./ml_test_sandbox) || TEST_OUTCOME=$?
+
+        # Fail-closed coverage - spawn refusal plus the kill-switch hint - is the
+        # security property that keeps an unsandboxed pytorch_inference from ever
+        # starting, so it must not depend on an external default either.
+        #
+        # user.max_user_namespaces is per-user-namespace, so setting it to 0
+        # inside a namespace we own denies every further user namespace in that
+        # subtree. That covers clone(CLONE_NEWUSER), which is what Sandbox2 uses,
+        # as well as unshare(CLONE_NEWUSER), which is what the test's probe uses;
+        # both then fail with ENOSPC. A seccomp profile denying only unshare(2)
+        # would desynchronise the two and make the probe report a capability
+        # Sandbox2 does not have. Verified on kernels 4.18 (this agent) and 7.0.
+        if [[ $TEST_OUTCOME -eq 0 ]]; then
+            echo "--- Re-running sandbox unit tests on host (fail_closed)"
+            unshare --user --map-root-user sh -c "
+                echo 0 > /proc/sys/user/max_user_namespaces || exit 1
+                cd '${SANDBOX_TEST_DIR}' || exit 1
+                ML_SANDBOX2_REQUIRE=fail_closed exec ./ml_test_sandbox
+            " || TEST_OUTCOME=$?
+        fi
     fi
 
 else
