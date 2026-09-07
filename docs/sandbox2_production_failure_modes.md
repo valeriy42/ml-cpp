@@ -43,6 +43,11 @@ confirm `pipeDirs` contains the ES temp directory, `rejectedPipeArgs` is empty, 
 `pipeDirAliases` shows any symlink double-mounts. Compare literal vs canonical pipe
 directory paths.
 
+`rejectedPipeArgs` lists only arguments whose value looks like a path — that is,
+contains a `/` — but which cannot be mounted. Scalar options such as
+`--namedPipeConnectTimeout=1` are not paths and are skipped silently, so the
+list really should be empty in a healthy spawn.
+
 ### Seccomp policy violation (SIGSYS)
 
 **Symptom:** `pytorch_inference` dies shortly after start or under load.

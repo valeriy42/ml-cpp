@@ -43,24 +43,38 @@ namespace sandbox {
 SArgDirExtraction extractArgDirs(const std::vector<std::string>& args) {
     SArgDirExtraction extraction;
     for (const std::string& arg : args) {
-        size_t eqPos = arg.find('=');
+        const size_t eqPos = arg.find('=');
         if (eqPos == std::string::npos || eqPos + 1 >= arg.size()) {
             continue;
         }
 
-        if (arg[eqPos + 1] != '/') {
+        const std::string value{arg.substr(eqPos + 1)};
+
+        // pytorch_inference takes scalar key=value options alongside its pipe
+        // paths - --namedPipeConnectTimeout=1, --numAllocations=2,
+        // --validElasticLicenseKeyConfirmed=true - and the pipe options cannot
+        // be told apart by name, since --input, --output and --restore carry
+        // paths while --inputIsPipe and friends are bare flags. A value with no
+        // '/' in it therefore cannot be a pipe path, and is skipped silently
+        // rather than recorded as rejected. Operators are told to expect
+        // rejectedPipeArgs to be empty when triaging FIFO problems, so listing
+        // every scalar option there would make the signal useless.
+        if (value.find('/') == std::string::npos) {
+            continue;
+        }
+
+        if (value[0] != '/') {
             extraction.m_RejectedPipeArgs.push_back(arg + " (path not absolute)");
             continue;
         }
 
-        std::string path = arg.substr(eqPos + 1);
-        size_t lastSlash = path.rfind('/');
+        const size_t lastSlash = value.rfind('/');
         if (lastSlash == 0) {
             extraction.m_RejectedPipeArgs.push_back(arg + " (no mountable directory)");
             continue;
         }
 
-        std::string dir = path.substr(0, lastSlash);
+        std::string dir = value.substr(0, lastSlash);
         char resolved[PATH_MAX];
         std::string canonical = ::realpath(dir.c_str(), resolved) != nullptr ? resolved : dir;
         extraction.m_ArgDirs.insert(canonical);
