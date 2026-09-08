@@ -324,7 +324,8 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
                 LOG_DEBUG(<< "Replacing stale registry entry for sandboxed pytorch_inference PID "
                           << sandboxPid << " before registering generation " << generation);
             }
-            m_PidRegistry->s_Children[sandboxPid] = {generation, sandbox, pidFdGuard.get()};
+            m_PidRegistry->s_Children[sandboxPid] = {generation, sandbox,
+                                                     pidFdGuard.get()};
             // The registry entry now owns the pidfd; do not double-close it via
             // the guard's destructor on the happy path.
             pidFdGuard.release();
