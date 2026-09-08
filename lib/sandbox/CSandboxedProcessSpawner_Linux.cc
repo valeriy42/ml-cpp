@@ -75,6 +75,26 @@ void closePidFdIfOpen(int pidFd) {
         ::close(pidFd);
     }
 }
+
+//! RAII owner for a pidfd between pidfd_open() and the registry insertion that
+//! takes over its lifetime. Closes the descriptor on destruction unless
+//! release() has handed ownership to the registry entry, so an exception (e.g.
+//! bad_alloc from the map node allocation) thrown before registration cannot
+//! leak the fd.
+class CScopedPidFd {
+public:
+    explicit CScopedPidFd(int pidFd) : m_PidFd{pidFd} {}
+    ~CScopedPidFd() { closePidFdIfOpen(m_PidFd); }
+    CScopedPidFd(const CScopedPidFd&) = delete;
+    CScopedPidFd& operator=(const CScopedPidFd&) = delete;
+    int get() const { return m_PidFd; }
+    //! Relinquish ownership: the caller (the registry entry) is now responsible
+    //! for closing the descriptor.
+    void release() { m_PidFd = -1; }
+
+private:
+    int m_PidFd;
+};
 #endif // SANDBOX2_AVAILABLE
 
 } // namespace
@@ -262,22 +282,11 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
     }
 
     auto sandbox = std::shared_ptr<sandbox2::Sandbox2>(std::move(sandboxPtr));
-    const int pidFd = static_cast<int>(
-        ::syscall(ML_NR_pidfd_open, static_cast<pid_t>(childPid), 0u));
+    CScopedPidFd pidFdGuard{static_cast<int>(
+        ::syscall(ML_NR_pidfd_open, static_cast<pid_t>(childPid), 0u))};
 
     const core::CProcess::TPid sandboxPid{childPid};
     std::uint64_t generation{0};
-    {
-        std::lock_guard<std::mutex> lock(m_PidRegistry->s_Mutex);
-        generation = ++m_PidRegistry->s_NextGeneration;
-        const auto existing = m_PidRegistry->s_Children.find(sandboxPid);
-        if (existing != m_PidRegistry->s_Children.end()) {
-            closePidFdIfOpen(existing->second.s_PidFd);
-            LOG_DEBUG(<< "Replacing stale registry entry for sandboxed pytorch_inference PID "
-                      << sandboxPid << " before registering generation " << generation);
-        }
-        m_PidRegistry->s_Children[sandboxPid] = {generation, sandbox, pidFd};
-    }
 
     // The sandboxee is a child of the Sandbox2 forkserver rather than of the
     // controller, so waitpid() never sees it. Own the sandbox instance on a
@@ -296,8 +305,32 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
     // capturing this: it can still be waiting on a live sandboxee when the
     // spawner is destroyed, and a raw pointer would be dangling by the time the
     // sandboxee exits.
+    //
+    // Registration and monitor-thread creation are the only operations that can
+    // throw after the sandboxee is live (bad_alloc from the map node, or a
+    // resource error from thread construction / detach()). All three share one
+    // recovery path that reaps the orphaned sandboxee. The monitor is a named
+    // thread rather than a temporary so that a detach() failure - which leaves
+    // the thread joinable and running - can be joined during cleanup instead of
+    // destroying a joinable thread and calling std::terminate().
+    std::thread monitor;
     try {
-        std::thread(
+        {
+            std::lock_guard<std::mutex> lock(m_PidRegistry->s_Mutex);
+            generation = ++m_PidRegistry->s_NextGeneration;
+            const auto existing = m_PidRegistry->s_Children.find(sandboxPid);
+            if (existing != m_PidRegistry->s_Children.end()) {
+                closePidFdIfOpen(existing->second.s_PidFd);
+                LOG_DEBUG(<< "Replacing stale registry entry for sandboxed pytorch_inference PID "
+                          << sandboxPid << " before registering generation " << generation);
+            }
+            m_PidRegistry->s_Children[sandboxPid] = {generation, sandbox, pidFdGuard.get()};
+            // The registry entry now owns the pidfd; do not double-close it via
+            // the guard's destructor on the happy path.
+            pidFdGuard.release();
+        }
+
+        monitor = std::thread(
             [ sandboxPid, registry = m_PidRegistry, sandbox, generation ]() {
                 const sandbox2::Result result{sandbox->AwaitResult()};
                 {
@@ -310,20 +343,33 @@ bool CSandboxedProcessSpawner::spawn(const std::string& processPath,
                     }
                 }
                 logSandboxeeTermination(sandboxPid, result);
-            })
-            .detach();
+            });
+        monitor.detach();
     } catch (const std::exception& e) {
-        {
-            std::lock_guard<std::mutex> lock(m_PidRegistry->s_Mutex);
-            const auto it = m_PidRegistry->s_Children.find(sandboxPid);
-            if (it != m_PidRegistry->s_Children.end() && it->second.s_Generation == generation) {
-                closePidFdIfOpen(it->second.s_PidFd);
-                m_PidRegistry->s_Children.erase(it);
-            }
-        }
+        // Reap the sandboxee first so a running-but-not-yet-detached monitor
+        // thread's AwaitResult() returns.
         sandbox->Kill();
-        sandbox->AwaitResult();
-        const std::string reason{"Failed to start Sandbox2 monitor thread: " +
+        if (monitor.joinable()) {
+            // detach() threw: the monitor thread is running and owns the registry
+            // cleanup and its own AwaitResult(); just join it so it is not
+            // destroyed joinable.
+            monitor.join();
+        } else {
+            // Registration or thread construction threw: no monitor ran, so this
+            // frame owns the reap and drops any registry entry it inserted.
+            {
+                std::lock_guard<std::mutex> lock(m_PidRegistry->s_Mutex);
+                const auto it = m_PidRegistry->s_Children.find(sandboxPid);
+                if (it != m_PidRegistry->s_Children.end() &&
+                    it->second.s_Generation == generation) {
+                    closePidFdIfOpen(it->second.s_PidFd);
+                    m_PidRegistry->s_Children.erase(it);
+                }
+            }
+            sandbox->AwaitResult();
+        }
+        // pidFdGuard closes the fd if registration never reached release().
+        const std::string reason{"Failed to register or monitor sandboxed pytorch_inference: " +
                                  std::string{e.what()} + SANDBOX2_DISABLE_HINT};
         LOG_ERROR(<< reason);
         assignFailureReason(failureReason, reason);

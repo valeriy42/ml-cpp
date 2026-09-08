@@ -117,8 +117,13 @@ if [[ "$HARDWARE_ARCH" = aarch64 && -z "${CPP_CROSS_COMPILE:-}" && "$(uname)" = 
         export LD_LIBRARY_PATH="${SYSROOT}:${LIB_DIRS}"
 
         echo "--- Re-running sandbox unit tests on host (enforced)"
+        # Hardcoded, not overridable: this re-run is the enforced-coverage gate.
+        # An env-var default (ML_SANDBOX2_HOST_REQUIRE:-enforced) would let a
+        # pipeline downgrade it to fail_closed and pass required CI without ever
+        # exercising a real sandbox. If a future agent genuinely cannot run
+        # enforced on the host, diagnose_userns.sh reports which stage it denies.
         (cd "${SANDBOX_TEST_DIR}" && \
-            ML_SANDBOX2_REQUIRE="${ML_SANDBOX2_HOST_REQUIRE:-enforced}" \
+            ML_SANDBOX2_REQUIRE=enforced \
             ./ml_test_sandbox) || TEST_OUTCOME=$?
 
         # Fail-closed coverage - spawn refusal plus the kill-switch hint - is the

@@ -392,6 +392,10 @@ std::string makeTestDir() {
 //! stack frame that has already gone away.
 struct SSpawnAttempt {
     std::atomic<bool> s_Finished{false};
+    //! Set by the caller when it gives up waiting. A spawn that completes
+    //! successfully after this is set owns nothing the caller will clean up, so
+    //! whichever side observes both flags terminates the sandboxee.
+    std::atomic<bool> s_Abandoned{false};
     bool s_Result{false};
     ml::core::CProcess::TPid s_ChildPid{0};
     std::string s_FailureReason;
@@ -416,15 +420,31 @@ bool spawnSandboxedWithTimeout(const std::shared_ptr<ml::sandbox::CSandboxedProc
     std::thread spawnThread([
         spawner, attempt, path = std::move(processPath), spawnArgs = std::move(args)
     ]() {
-        attempt->s_Result = spawner->spawn(path, spawnArgs, attempt->s_ChildPid,
-                                           &attempt->s_FailureReason);
+        const bool spawned = spawner->spawn(path, spawnArgs, attempt->s_ChildPid,
+                                            &attempt->s_FailureReason);
+        attempt->s_Result = spawned;
         attempt->s_Finished.store(true, std::memory_order_release);
+        // If the caller already timed out and walked away, a late success would
+        // otherwise leak a live sandboxee that nothing else holds a handle to.
+        if (attempt->s_Abandoned.load(std::memory_order_acquire) && spawned &&
+            attempt->s_ChildPid > 0) {
+            spawner->terminateChild(attempt->s_ChildPid);
+        }
     });
 
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (attempt->s_Finished.load(std::memory_order_acquire) == false) {
         if (std::chrono::steady_clock::now() >= deadline) {
+            // Mark abandoned before detaching so a still-running spawn cleans up
+            // after itself. Then handle the race where the spawn finished just
+            // before we gave up: terminateChild() is idempotent, so a double
+            // call (here and in the thread) is harmless.
+            attempt->s_Abandoned.store(true, std::memory_order_release);
             spawnThread.detach();
+            if (attempt->s_Finished.load(std::memory_order_acquire) &&
+                attempt->s_Result && attempt->s_ChildPid > 0) {
+                spawner->terminateChild(attempt->s_ChildPid);
+            }
             failureReason = "Timed out waiting for Sandbox2 spawn after " +
                             ml::core::CStringUtils::typeToString(timeout.count()) + " seconds";
             return false;
