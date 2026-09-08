@@ -25,7 +25,7 @@ namespace pytorch_inference {
 
 //! Paths bind-mounted read-only for every sandboxed pytorch_inference process,
 //! excluding the per-install binDir and libDir. Must match the fixed mounts in
-//! buildPytorchInferencePolicy() in CPytorchInferenceSandboxPolicy_Linux.cc; the Sandbox2
+//! buildPytorchInferencePolicy() in CPytorchInferenceSandboxPolicy.cc; the Sandbox2
 //! policy is a superset of the legacy BPF filter, not a 1:1 syscall mapping.
 inline const std::vector<std::string>& fixedSandboxMountDirectories() {
     static const std::vector<std::string> PATHS{

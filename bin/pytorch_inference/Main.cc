@@ -293,7 +293,7 @@ int main(int argc, char** argv) {
 
 #ifdef __linux__
     // ML_SANDBOXED=1 is set only by the controller's Sandbox2 executor
-    // (CPytorchInferenceSandboxPolicy_Linux.cc). Untrusted model input cannot influence
+    // (CSandboxedProcessSpawner_Linux.cc). Untrusted model input cannot influence
     // pre-exec environment. Sandbox2 is the default pytorch_inference spawn route
     // unless --disableSandbox selects the legacy path. ML_SANDBOXED=1 <=> Sandbox2;
     // unset ML_SANDBOXED (including on the kill-switch path) installs seccomp here.
