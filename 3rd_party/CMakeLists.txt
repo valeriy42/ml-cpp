@@ -94,6 +94,27 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
     find_package(Git REQUIRED)
     foreach(_patch ${ML_SANDBOXED_API_PATCHES})
+      # Re-running configure in an existing build directory can re-enter this
+      # block even though the checked-out source was already patched in an
+      # earlier configure (observed: FetchContent's populated-tracking does
+      # not reliably short-circuit this across separate `cmake` invocations
+      # on every CMake/generator combination). `git apply --check` alone
+      # cannot distinguish "already applied" from "genuinely drifted" - both
+      # fail to apply cleanly - so try a reverse-check first: if the patch
+      # reverses cleanly, its change is already present and this is the
+      # idempotent-rerun case, not drift.
+      execute_process(
+        COMMAND ${GIT_EXECUTABLE} apply --reverse --check ${ML_SANDBOXED_API_PATCH_DIR}/${_patch}
+        WORKING_DIRECTORY ${sandboxed-api_SOURCE_DIR}
+        RESULT_VARIABLE _patch_already_applied_result
+        OUTPUT_QUIET
+        ERROR_QUIET
+      )
+      if(_patch_already_applied_result EQUAL 0)
+        message(STATUS "sandboxed-api patch already applied (reconfigure): ${_patch}")
+        continue()
+      endif()
+
       execute_process(
         COMMAND ${GIT_EXECUTABLE} apply --check ${ML_SANDBOXED_API_PATCH_DIR}/${_patch}
         WORKING_DIRECTORY ${sandboxed-api_SOURCE_DIR}
