@@ -69,6 +69,8 @@ const std::string CForecastRunner::ERROR_MEMORY_LIMIT_DISK(
     "Forecast cannot be executed as forecast memory usage is predicted to exceed 500MB");
 const std::string CForecastRunner::ERROR_MEMORY_LIMIT_DISKSPACE(
     "Forecast cannot be executed as models exceed internal memory limit and available disk space is insufficient");
+const std::string CForecastRunner::ERROR_FORECAST_PERSIST_RESTORE_FAILED(
+    "Forecast cannot be executed due to an internal error persisting models to disk");
 const std::string CForecastRunner::ERROR_NOT_SUPPORTED_FOR_POPULATION_MODELS("Forecast is not supported for population analysis");
 const std::string CForecastRunner::ERROR_NO_SUPPORTED_FUNCTIONS("Forecast is not supported for the used functions");
 const std::string CForecastRunner::WARNING_INVALID_EXPIRY("Forecast expires_in invalid, setting to 14 days");
@@ -130,6 +132,7 @@ void CForecastRunner::forecastWorker() {
             double totalNumberOfForecastableModels =
                 static_cast<double>(forecastJob.s_NumberOfForecastableModels);
             std::size_t failedForecasts = 0;
+            bool persistOrRestoreError = false;
             sink.writeStats(0.0, 0, forecastJob.s_Messages);
 
             // while loops allow us to free up memory for every model right after each forecast is done
@@ -137,11 +140,24 @@ void CForecastRunner::forecastWorker() {
                 TForecastResultSeries& series = forecastJob.s_ForecastSeries.back();
                 std::unique_ptr<model::CForecastModelPersist::CRestore> modelRestore;
 
+                if (series.s_PersistError) {
+                    persistOrRestoreError = true;
+                    messages.insert(ERROR_FORECAST_PERSIST_RESTORE_FAILED);
+                    forecastJob.s_ForecastSeries.pop_back();
+                    continue;
+                }
+
                 // initialize persistence restore exactly once
                 if (!series.s_ToForecastPersisted.empty()) {
                     modelRestore = std::make_unique<model::CForecastModelPersist::CRestore>(
                         series.s_ModelParams, series.s_MinimumSeasonalVarianceScale,
                         series.s_ToForecastPersisted);
+                    if (modelRestore->restoreError()) {
+                        persistOrRestoreError = true;
+                        messages.insert(ERROR_FORECAST_PERSIST_RESTORE_FAILED);
+                        forecastJob.s_ForecastSeries.pop_back();
+                        continue;
+                    }
                 }
 
                 while (series.s_ToForecast.empty() == false || modelRestore != nullptr) {
@@ -159,7 +175,11 @@ void CForecastRunner::forecastWorker() {
                                 feature, byFieldValue, std::move(model),
                                 firstDataTime, lastDataTime);
                         } else {
-                            // restorer exhausted, no need for further restoring
+                            if (modelRestore->restoreError()) {
+                                persistOrRestoreError = true;
+                                messages.insert(ERROR_FORECAST_PERSIST_RESTORE_FAILED);
+                            }
+                            // restorer exhausted or failed, no need for further restoring
                             modelRestore.reset();
                             break;
                         }
@@ -197,8 +217,10 @@ void CForecastRunner::forecastWorker() {
                 forecastJob.s_ForecastSeries.pop_back();
             }
             // write final message
-            sink.writeStats(1.0, timer.stop(), messages,
-                            failedForecasts != forecastJob.s_NumberOfForecastableModels);
+            const bool successful =
+                !persistOrRestoreError && processedModels > 0.0 &&
+                failedForecasts != forecastJob.s_NumberOfForecastableModels;
+            sink.writeStats(1.0, timer.stop(), messages, successful);
 
             // important: reset the structure to decrease shared pointer reference counts
             forecastJob.reset();

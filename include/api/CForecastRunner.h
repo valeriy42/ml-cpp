@@ -116,6 +116,7 @@ private:
     static const std::string ERROR_BAD_MODEL_MEMORY_LIMIT;
     static const std::string ERROR_MEMORY_LIMIT_DISK;
     static const std::string ERROR_MEMORY_LIMIT_DISKSPACE;
+    static const std::string ERROR_FORECAST_PERSIST_RESTORE_FAILED;
     static const std::string ERROR_NOT_SUPPORTED_FOR_POPULATION_MODELS;
     static const std::string ERROR_NO_SUPPORTED_FUNCTIONS;
     static const std::string WARNING_INVALID_EXPIRY;

@@ -561,6 +561,9 @@ CAnomalyDetector::getForecastModels(bool persistOnDisk,
         }
 
         series.s_ToForecastPersisted = persister.finalizePersistAndGetFile();
+        if (!persister.persistedOk()) {
+            series.s_PersistError = true;
+        }
     } else {
 
         for (std::size_t pid = 0; pid < m_DataGatherer->numberPeople(); ++pid) {

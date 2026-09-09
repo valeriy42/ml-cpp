@@ -80,7 +80,11 @@ BOOST_AUTO_TEST_CASE(testPersistAndRestore) {
 
     persister.addModel(&otherTimeSeriesModelEmptyByField, 25, 65,
                        model_t::EFeature::E_IndividualHighMedianByPerson, "");
+    BOOST_REQUIRE(persister.persistedOk());
+    BOOST_REQUIRE_EQUAL(3, persister.numModelsPersisted());
     std::string persistedModels = persister.finalizePersistAndGetFile();
+    BOOST_REQUIRE(persister.persistedOk());
+    BOOST_TEST_REQUIRE(!persistedModels.empty());
 
     {
         CForecastModelPersist::CRestore restorer(params, minimumSeasonalVarianceScale,
@@ -164,8 +168,36 @@ BOOST_AUTO_TEST_CASE(testPersistAndRestore) {
 
         BOOST_TEST_REQUIRE(!restorer.nextModel(restoredModel, firstDataTime, lastDataTime,
                                                restoredFeature, restoredByFieldValue));
+        BOOST_TEST_REQUIRE(!restorer.restoreError());
     }
     std::remove(persistedModels.c_str());
+}
+
+BOOST_AUTO_TEST_CASE(testPersistIoFailure) {
+    CForecastModelPersist::CPersist persister("/nonexistent/directory/for/forecast/persist");
+    BOOST_TEST_REQUIRE(!persister.persistedOk());
+    BOOST_REQUIRE_EQUAL(0, persister.numModelsPersisted());
+    std::string persistedModels = persister.finalizePersistAndGetFile();
+    BOOST_TEST_REQUIRE(persistedModels.empty());
+    BOOST_TEST_REQUIRE(!persister.persistedOk());
+}
+
+BOOST_AUTO_TEST_CASE(testRestoreIoFailure) {
+    core_t::TTime bucketLength{1800};
+    double minimumSeasonalVarianceScale = 0.2;
+    SModelParams params{bucketLength};
+
+    CForecastModelPersist::CRestore restorer(params, minimumSeasonalVarianceScale,
+                                             "/nonexistent/directory/forecast-persist-file");
+    BOOST_TEST_REQUIRE(restorer.restoreError());
+
+    CForecastModelPersist::TMathsModelPtr restoredModel;
+    core_t::TTime firstDataTime;
+    core_t::TTime lastDataTime;
+    std::string restoredByFieldValue;
+    model_t::EFeature restoredFeature;
+    BOOST_TEST_REQUIRE(!restorer.nextModel(restoredModel, firstDataTime, lastDataTime,
+                                             restoredFeature, restoredByFieldValue));
 }
 
 BOOST_AUTO_TEST_CASE(testPersistAndRestoreEmpty) {
@@ -174,7 +206,10 @@ BOOST_AUTO_TEST_CASE(testPersistAndRestoreEmpty) {
     SModelParams params{bucketLength};
 
     CForecastModelPersist::CPersist persister(ml::test::CTestTmpDir::tmpDir());
+    BOOST_REQUIRE(persister.persistedOk());
     std::string persistedModels = persister.finalizePersistAndGetFile();
+    BOOST_REQUIRE(persister.persistedOk());
+    BOOST_TEST_REQUIRE(!persistedModels.empty());
     {
         CForecastModelPersist::CRestore restorer(params, minimumSeasonalVarianceScale,
                                                  persistedModels);
@@ -186,6 +221,7 @@ BOOST_AUTO_TEST_CASE(testPersistAndRestoreEmpty) {
 
         BOOST_TEST_REQUIRE(!restorer.nextModel(restoredModel, firstDataTime, lastDataTime,
                                                restoredFeature, restoredByFieldValue));
+        BOOST_TEST_REQUIRE(!restorer.restoreError());
     }
     std::remove(persistedModels.c_str());
 }

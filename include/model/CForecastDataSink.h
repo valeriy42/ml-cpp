@@ -95,6 +95,7 @@ public:
         int s_DetectorIndex;
         std::vector<CForecastModelWrapper> s_ToForecast;
         std::string s_ToForecastPersisted;
+        bool s_PersistError{false};
         std::string s_PartitionFieldName;
         std::string s_PartitionFieldValue;
         std::string s_ByFieldName;

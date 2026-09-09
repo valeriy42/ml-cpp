@@ -61,6 +61,12 @@ public:
         //! close the output file stream
         std::string finalizePersistAndGetFile();
 
+        //! true if persist opened, wrote, and closed without I/O error
+        bool persistedOk() const;
+
+        //! number of models written to the persist file
+        std::size_t numModelsPersisted() const;
+
     private:
         //! the filename to which to persist
         boost::filesystem::path m_FileName;
@@ -69,7 +75,10 @@ public:
         std::ofstream m_OutStream;
 
         //! number of models persisted
-        size_t m_ModelCount;
+        std::size_t m_ModelCount;
+
+        //! false after any persist I/O failure
+        bool m_PersistOk;
     };
 
     class MODEL_EXPORT CRestore final {
@@ -85,6 +94,9 @@ public:
                        model_t::EFeature& feature,
                        std::string& byFieldValue);
 
+        //! true if restore hit a parse or I/O error (distinct from clean end-of-stream)
+        bool restoreError() const;
+
     private:
         //! model parameters required in order to restore the model
         const SModelParams m_ModelParams;
@@ -97,6 +109,9 @@ public:
 
         //! the model state restorer
         core::CJsonStateRestoreTraverser m_RestoreTraverser;
+
+        //! true after any restore parse or I/O error
+        bool m_RestoreError;
     };
 };
 }

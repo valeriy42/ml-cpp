@@ -19,6 +19,11 @@
 
 #include <maths/time_series/CModelStateSerialiser.h>
 
+#include <atomic>
+#include <chrono>
+#include <cerrno>
+#include <cstring>
+
 namespace ml {
 namespace model {
 
@@ -30,13 +35,31 @@ const std::string FIRST_DATA_TIME_TAG("first_data_time");
 const std::string LAST_DATA_TIME_TAG("last_data_time");
 const std::string MODEL_TAG("model");
 const std::string BY_FIELD_VALUE_TAG("by_field_value");
+
+std::string uniqueForecastPersistFileName() {
+    static std::atomic<std::uint64_t> counter{0};
+    const auto id = counter.fetch_add(1, std::memory_order_relaxed);
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    return "forecast-persist-" + std::to_string(now) + "-" + std::to_string(id);
+}
 }
 
 CForecastModelPersist::CPersist::CPersist(const std::string& temporaryPath)
-    : m_FileName(temporaryPath), m_OutStream(), m_ModelCount(0) {
-    m_FileName /= boost::filesystem::unique_path("forecast-persist-%%%%-%%%%-%%%%-%%%%");
-    m_OutStream.open(m_FileName.string());
+    : m_FileName(temporaryPath), m_OutStream(), m_ModelCount(0), m_PersistOk(true) {
+    m_FileName /= uniqueForecastPersistFileName();
+    m_OutStream.open(m_FileName.string(), std::ios::out | std::ios::trunc);
+    if (!m_OutStream.is_open() || !m_OutStream.good()) {
+        LOG_ERROR(<< "Failed to open forecast persist file '" << m_FileName.string()
+                  << "' error '" << std::strerror(errno) << "'");
+        m_PersistOk = false;
+        return;
+    }
     m_OutStream << "[";
+    if (!m_OutStream.good()) {
+        LOG_ERROR(<< "Failed to write forecast persist file header '" << m_FileName.string()
+                  << "' error '" << std::strerror(errno) << "'");
+        m_PersistOk = false;
+    }
 }
 
 void CForecastModelPersist::CPersist::addModel(const maths::common::CModel* model,
@@ -44,7 +67,11 @@ void CForecastModelPersist::CPersist::addModel(const maths::common::CModel* mode
                                                core_t::TTime lastDataTime,
                                                const model_t::EFeature feature,
                                                const std::string& byFieldValue) {
-    if (m_ModelCount++ > 0) {
+    if (!m_PersistOk) {
+        return;
+    }
+
+    if (m_ModelCount > 0) {
         m_OutStream << ",";
     }
 
@@ -61,13 +88,52 @@ void CForecastModelPersist::CPersist::addModel(const maths::common::CModel* mode
 
     core::CJsonStatePersistInserter inserter(m_OutStream);
     inserter.insertLevel(FORECAST_MODEL_PERSIST_TAG, persistOneModel);
+
+    if (!m_OutStream.good()) {
+        LOG_ERROR(<< "Failed to persist forecast model to '" << m_FileName.string()
+                  << "' error '" << std::strerror(errno) << "'");
+        m_PersistOk = false;
+        return;
+    }
+
+    ++m_ModelCount;
 }
 
 std::string CForecastModelPersist::CPersist::finalizePersistAndGetFile() {
+    if (!m_PersistOk) {
+        if (m_OutStream.is_open()) {
+            m_OutStream.close();
+        }
+        return {};
+    }
+
     m_OutStream << "]";
+    m_OutStream.flush();
+    if (!m_OutStream.good()) {
+        LOG_ERROR(<< "Failed to finalize forecast persist file '" << m_FileName.string()
+                  << "' error '" << std::strerror(errno) << "'");
+        m_PersistOk = false;
+        m_OutStream.close();
+        return {};
+    }
+
     m_OutStream.close();
+    if (!m_OutStream.good()) {
+        LOG_ERROR(<< "Failed to close forecast persist file '" << m_FileName.string()
+                  << "' error '" << std::strerror(errno) << "'");
+        m_PersistOk = false;
+        return {};
+    }
 
     return m_FileName.string();
+}
+
+bool CForecastModelPersist::CPersist::persistedOk() const {
+    return m_PersistOk;
+}
+
+std::size_t CForecastModelPersist::CPersist::numModelsPersisted() const {
+    return m_ModelCount;
 }
 
 CForecastModelPersist::CRestore::CRestore(const SModelParams& modelParams,
@@ -75,7 +141,12 @@ CForecastModelPersist::CRestore::CRestore(const SModelParams& modelParams,
                                           const std::string& fileName)
     : m_ModelParams(modelParams),
       m_MinimumSeasonalVarianceScale(minimumSeasonalVarianceScale),
-      m_InStream(fileName), m_RestoreTraverser(m_InStream) {
+      m_InStream(fileName), m_RestoreTraverser(m_InStream), m_RestoreError(false) {
+    if (!m_InStream.is_open() || !m_InStream.good()) {
+        LOG_ERROR(<< "Failed to open forecast persist file '" << fileName << "' error '"
+                  << std::strerror(errno) << "'");
+        m_RestoreError = true;
+    }
 }
 
 bool CForecastModelPersist::CRestore::nextModel(TMathsModelPtr& model,
@@ -83,17 +154,23 @@ bool CForecastModelPersist::CRestore::nextModel(TMathsModelPtr& model,
                                                 core_t::TTime& lastDataTime,
                                                 model_t::EFeature& feature,
                                                 std::string& byFieldValue) {
+    if (m_RestoreError) {
+        return false;
+    }
+
     if (m_RestoreTraverser.isEof() || m_RestoreTraverser.name().empty()) {
         return false;
     }
 
     if (m_RestoreTraverser.name() != FORECAST_MODEL_PERSIST_TAG) {
         LOG_ERROR(<< "Failed to restore forecast model, unexpected tag");
+        m_RestoreError = true;
         return false;
     }
 
     if (!m_RestoreTraverser.hasSubLevel()) {
         LOG_ERROR(<< "Failed to restore forecast model, unexpected format");
+        m_RestoreError = true;
         return false;
     }
 
@@ -156,6 +233,7 @@ bool CForecastModelPersist::CRestore::nextModel(TMathsModelPtr& model,
     if (m_RestoreTraverser.traverseSubLevel(std::bind<bool>(
             restoreOneModel, std::placeholders::_1, std::ref(originalModel))) == false) {
         LOG_ERROR(<< "Failed to restore forecast model, internal error");
+        m_RestoreError = true;
         return false;
     }
 
@@ -163,6 +241,10 @@ bool CForecastModelPersist::CRestore::nextModel(TMathsModelPtr& model,
     m_RestoreTraverser.nextObject();
 
     return true;
+}
+
+bool CForecastModelPersist::CRestore::restoreError() const {
+    return m_RestoreError;
 }
 
 } /* namespace model  */
