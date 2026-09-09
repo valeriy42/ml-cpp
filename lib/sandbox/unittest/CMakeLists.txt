@@ -14,12 +14,14 @@ project("ML Sandbox unit tests")
 set(SRCS
   Main.cc
   CMlSandboxAvailabilityTest.cc
+  CPytorchInferenceSandboxPolicyTest.cc
   )
 
 set(ML_LINK_LIBRARIES
   ${Boost_LIBRARIES_WITH_UNIT_TEST}
   MlCore
   MlSandbox
+  MlSeccomp
   MlTest
   )
 
@@ -31,6 +33,7 @@ if(TARGET sandbox2::sandbox2 AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # elsewhere rather than compiled out with #ifdef, since sandbox2 headers
   # are unavailable on non-Linux configure runs.
   list(APPEND SRCS CSandboxForkserverSmokeTest.cc)
+  list(APPEND SRCS CPytorchInferenceSandboxPolicyMechanismTest_Linux.cc)
   list(APPEND ML_LINK_LIBRARIES sandbox2::sandbox2)
 
   # Deliberately-dependency-free sandboxee payload for the smoke test above.
@@ -50,6 +53,17 @@ if(TARGET sandbox2::sandbox2 AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     POSITION_INDEPENDENT_CODE TRUE
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/payloads
     )
+
+  # PR C's purpose-built allowlisted mechanism-probe payload (design.md
+  # gates V4/V7/V16). Same dependency-free, dynamically-linked pattern as
+  # sandbox2_smoke_payload above, for the same CI-image reason.
+  add_executable(ml_sandbox_probe EXCLUDE_FROM_ALL
+    payloads/ml_sandbox_probe.cc
+    )
+  set_target_properties(ml_sandbox_probe PROPERTIES
+    POSITION_INDEPENDENT_CODE TRUE
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/payloads
+    )
 endif()
 
 ml_add_test_executable(sandbox ${SRCS})
@@ -58,5 +72,12 @@ if(TARGET sandbox2_smoke_payload)
   add_dependencies(ml_test_sandbox sandbox2_smoke_payload)
   target_compile_definitions(ml_test_sandbox PRIVATE
     ML_SANDBOX2_SMOKE_PAYLOAD="$<TARGET_FILE:sandbox2_smoke_payload>"
+    )
+endif()
+
+if(TARGET ml_sandbox_probe)
+  add_dependencies(ml_test_sandbox ml_sandbox_probe)
+  target_compile_definitions(ml_test_sandbox PRIVATE
+    ML_SANDBOX2_PROBE_PAYLOAD="$<TARGET_FILE:ml_sandbox_probe>"
     )
 endif()
