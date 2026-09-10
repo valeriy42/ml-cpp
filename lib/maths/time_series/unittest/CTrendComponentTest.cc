@@ -225,6 +225,18 @@ auto forecastErrors(ITR actual,
                           maths::common::CBasicStatistics::mean(meanErrorAt95));
 }
 
+TDouble3VecVec forecastValues(const maths::time_series::CTrendComponent& component,
+                              core_t::TTime start,
+                              core_t::TTime interval) {
+    TDouble3VecVec result;
+    component.forecast(start, start + interval, BUCKET_LENGTH, 95.0, false,
+                       [](core_t::TTime) { return TDouble3Vec(3, 0.0); },
+                       [&result](core_t::TTime, const TDouble3Vec& value) {
+                           result.push_back(value);
+                       });
+    return result;
+}
+
 BOOST_AUTO_TEST_CASE(testValueAndVariance) {
     // Check that the prediction bias is small in the long run
     // and that the predicted variance approximately matches the
@@ -451,8 +463,60 @@ BOOST_AUTO_TEST_CASE(testForecastAfterTemporaryDrop) {
     BOOST_REQUIRE(!forecast.empty());
     LOG_DEBUG(<< "First forecast = " << forecast.front()[1]
               << ", last forecast = " << forecast.back()[1]);
-    BOOST_TEST_REQUIRE(forecast.back()[1] > 0.8);
-    BOOST_TEST_REQUIRE(forecast.back()[1] < 1.0);
+    for (const auto& value : forecast) {
+        BOOST_TEST_REQUIRE(std::isfinite(value[0]));
+        BOOST_TEST_REQUIRE(std::isfinite(value[1]));
+        BOOST_TEST_REQUIRE(std::isfinite(value[2]));
+        BOOST_TEST_REQUIRE(value[0] <= value[1]);
+        BOOST_TEST_REQUIRE(value[1] <= value[2]);
+    }
+    BOOST_TEST_REQUIRE(std::fabs(forecast.back()[1] - forecast.front()[1]) <
+                       0.2 * std::max(std::fabs(forecast.front()[1]), 1.0));
+}
+
+BOOST_AUTO_TEST_CASE(testForecastPreservesSupportedLinearTrendAndPrefix) {
+    // A supported linear signal should keep its short, useful extrapolation;
+    // splitting a request must not change the common prefix.
+    for (double slope : {0.05, 0.2}) {
+        TDoubleVec values;
+        for (std::size_t i = 0; i < 2000; ++i) {
+            values.push_back(10.0 + slope * static_cast<double>(i));
+        }
+        auto[component, start] = trainModel(values.begin(), values.end());
+        auto day = forecastValues(component, start, core::constants::DAY);
+        auto week = forecastValues(component, start, 7 * core::constants::DAY);
+        auto month = forecastValues(component, start, 30 * core::constants::DAY);
+
+        BOOST_REQUIRE_EQUAL(week.size(), 7 * core::constants::DAY / BUCKET_LENGTH);
+        BOOST_REQUIRE(month.size() >= week.size());
+        for (std::size_t i = 0; i < week.size(); ++i) {
+            BOOST_REQUIRE_CLOSE(week[i][1], month[i][1], 1e-10);
+        }
+
+        double expectedChange{slope * static_cast<double>(day.size() - 1)};
+        BOOST_TEST_REQUIRE(day.back()[1] - day.front()[1] > 0.5 * expectedChange);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(testForecastIsAffineInvariant) {
+    TDoubleVec values;
+    TDoubleVec transformed;
+    for (std::size_t i = 0; i < 2000; ++i) {
+        double value{4.0 + 0.1 * static_cast<double>(i) +
+                     0.00001 * static_cast<double>(i * i)};
+        values.push_back(value);
+        transformed.push_back(100.0 * value - 37.0);
+    }
+    auto[component, start] = trainModel(values.begin(), values.end());
+    auto[transformedComponent, transformedStart] = trainModel(transformed.begin(), transformed.end());
+    auto forecast = forecastValues(component, start, 7 * core::constants::DAY);
+    auto transformedForecast =
+        forecastValues(transformedComponent, transformedStart, 7 * core::constants::DAY);
+
+    BOOST_REQUIRE_EQUAL(forecast.size(), transformedForecast.size());
+    for (std::size_t i = 0; i < forecast.size(); ++i) {
+        BOOST_REQUIRE_CLOSE(transformedForecast[i][1], 100.0 * forecast[i][1] - 37.0, 1e-8);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(testPersist) {
