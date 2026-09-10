@@ -601,10 +601,14 @@ void CTrendComponent::forecast(core_t::TTime startTime,
         double extrapolationVariance{
             common::CBasicStatistics::mean(extrapolationVarianceMoments)};
         double extrapolationWeight{0.0};
-        if (longTermVariance > 0.0 && std::isfinite(longTermVariance) &&
-            extrapolationVariance > 0.0 && std::isfinite(extrapolationVariance)) {
-            extrapolationWeight = std::min(longTermVariance / extrapolationVariance, 1.0);
-            extrapolationWeight = std::isfinite(extrapolationWeight) ? extrapolationWeight : 0.0;
+        if (extrapolationVariance >= 0.0 && std::isfinite(extrapolationVariance)) {
+            if (extrapolationVariance == 0.0) {
+                extrapolationWeight = 1.0;
+            } else if (longTermVariance > 0.0 && std::isfinite(longTermVariance)) {
+                extrapolationWeight = std::min(longTermVariance / extrapolationVariance, 1.0);
+                extrapolationWeight =
+                    std::isfinite(extrapolationWeight) ? extrapolationWeight : 0.0;
+            }
         }
         variances[NUMBER_MODELS] = longTermVariance;
         for (auto v = variances.rbegin(); v != variances.rend(); ++v) {

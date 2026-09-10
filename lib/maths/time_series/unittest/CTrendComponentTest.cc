@@ -498,6 +498,48 @@ BOOST_AUTO_TEST_CASE(testForecastPreservesSupportedLinearTrendAndPrefix) {
     }
 }
 
+BOOST_AUTO_TEST_CASE(testForecastPreservesExactLinearTrendWithZeroUncertainty) {
+    // An exact line with zero extrapolation uncertainty must still extrapolate.
+    maths::time_series::CTrendComponent component{0.1};
+    core_t::TTime time{0};
+    for (std::size_t i = 0; i < 2000; ++i, time += BUCKET_LENGTH) {
+        component.add(time, 10.0 + 0.2 * static_cast<double>(i));
+        component.propagateForwardsByTime(BUCKET_LENGTH);
+    }
+    component.shiftOrigin(time);
+
+    std::ostringstream state;
+    core::CJsonStatePersistInserter::persist(
+        state, std::bind_front(&maths::time_series::CTrendComponent::acceptPersistInserter,
+                               &component));
+    std::string zeroVarianceState{state.str()};
+    std::size_t position{0};
+    for (std::size_t i = 0; i < 8; ++i) {
+        position = zeroVarianceState.find("\"e\":{\"7.1\"", position);
+        BOOST_REQUIRE_NE(position, std::string::npos);
+        position = zeroVarianceState.find("\"c\":\"", position);
+        BOOST_REQUIRE_NE(position, std::string::npos);
+        std::size_t end{zeroVarianceState.find('"', position + 5)};
+        BOOST_REQUIRE_NE(end, std::string::npos);
+        zeroVarianceState.replace(position + 5, end - position - 5, "250:1,0,0");
+        position += 5 + std::string{"250:1,0,0"}.size();
+    }
+
+    std::istringstream stateStream{"{\"topLevel\":" + zeroVarianceState + "}"};
+    core::CJsonStateRestoreTraverser traverser{stateStream};
+    maths::common::SDistributionRestoreParams params{maths_t::E_ContinuousData, 0.1};
+    maths::time_series::CTrendComponent restored{0.1};
+    BOOST_REQUIRE(traverser.traverseSubLevel([&](auto& traverser_) {
+        return restored.acceptRestoreTraverser(params, traverser_);
+    }));
+
+    auto forecast = forecastValues(restored, time, core::constants::DAY);
+
+    BOOST_REQUIRE_EQUAL(forecast.size(), core::constants::DAY / BUCKET_LENGTH);
+    BOOST_TEST_REQUIRE(forecast.back()[1] - forecast.front()[1] > 0.5 * 0.2 *
+                                                                    static_cast<double>(forecast.size() - 1));
+}
+
 BOOST_AUTO_TEST_CASE(testForecastIsAffineInvariant) {
     TDoubleVec values;
     TDoubleVec transformed;
