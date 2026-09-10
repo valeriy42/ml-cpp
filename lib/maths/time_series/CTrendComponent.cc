@@ -598,16 +598,15 @@ void CTrendComponent::forecast(core_t::TTime startTime,
         for (std::size_t j = 0; j < NUMBER_MODELS; ++j) {
             extrapolationVarianceMoments.add(variances[j], modelWeights[j]);
         }
-        double extrapolationVariance{
-            common::CBasicStatistics::mean(extrapolationVarianceMoments)};
+        double extrapolationVariance{common::CBasicStatistics::mean(extrapolationVarianceMoments)};
         double extrapolationWeight{0.0};
         if (extrapolationVariance >= 0.0 && std::isfinite(extrapolationVariance)) {
             if (extrapolationVariance == 0.0) {
                 extrapolationWeight = 1.0;
             } else if (longTermVariance > 0.0 && std::isfinite(longTermVariance)) {
                 extrapolationWeight = std::min(longTermVariance / extrapolationVariance, 1.0);
-                extrapolationWeight =
-                    std::isfinite(extrapolationWeight) ? extrapolationWeight : 0.0;
+                extrapolationWeight = std::isfinite(extrapolationWeight) ? extrapolationWeight
+                                                                         : 0.0;
             }
         }
         variances[NUMBER_MODELS] = longTermVariance;
@@ -622,9 +621,10 @@ void CTrendComponent::forecast(core_t::TTime startTime,
         double variance{a * common::CBasicStatistics::mean(variance_) + b * longTermVariance};
 
         double prediction{this->value(modelWeights, models, scaledTime)};
-        prediction = std::isfinite(prediction) ? extrapolationWeight * prediction +
-                                                   (1.0 - extrapolationWeight) * startPrediction
-                                              : startPrediction;
+        prediction = std::isfinite(prediction)
+                         ? extrapolationWeight * prediction +
+                               (1.0 - extrapolationWeight) * startPrediction
+                         : startPrediction;
         TVector2x1 trend{confidenceInterval(prediction, variance, confidence)};
         TDouble3Vec seasonal_(seasonal(time));
         TDouble3Vec level_(level.forecast(time, seasonal_[1] + trend.mean(), confidence));

@@ -536,8 +536,8 @@ BOOST_AUTO_TEST_CASE(testForecastPreservesExactLinearTrendWithZeroUncertainty) {
     auto forecast = forecastValues(restored, time, core::constants::DAY);
 
     BOOST_REQUIRE_EQUAL(forecast.size(), core::constants::DAY / BUCKET_LENGTH);
-    BOOST_TEST_REQUIRE(forecast.back()[1] - forecast.front()[1] > 0.5 * 0.2 *
-                                                                    static_cast<double>(forecast.size() - 1));
+    BOOST_TEST_REQUIRE(forecast.back()[1] - forecast.front()[1] >
+                       0.5 * 0.2 * static_cast<double>(forecast.size() - 1));
 }
 
 BOOST_AUTO_TEST_CASE(testForecastIsAffineInvariant) {
@@ -550,10 +550,11 @@ BOOST_AUTO_TEST_CASE(testForecastIsAffineInvariant) {
         transformed.push_back(100.0 * value - 37.0);
     }
     auto[component, start] = trainModel(values.begin(), values.end());
-    auto[transformedComponent, transformedStart] = trainModel(transformed.begin(), transformed.end());
+    auto[transformedComponent, transformedStart] =
+        trainModel(transformed.begin(), transformed.end());
     auto forecast = forecastValues(component, start, 7 * core::constants::DAY);
-    auto transformedForecast =
-        forecastValues(transformedComponent, transformedStart, 7 * core::constants::DAY);
+    auto transformedForecast = forecastValues(transformedComponent, transformedStart,
+                                              7 * core::constants::DAY);
 
     BOOST_REQUIRE_EQUAL(forecast.size(), transformedForecast.size());
     for (std::size_t i = 0; i < forecast.size(); ++i) {
