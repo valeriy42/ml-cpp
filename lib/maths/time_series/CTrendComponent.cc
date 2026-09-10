@@ -604,7 +604,10 @@ void CTrendComponent::forecast(core_t::TTime startTime,
             if (extrapolationVariance == 0.0) {
                 extrapolationWeight = 1.0;
             } else if (longTermVariance > 0.0 && std::isfinite(longTermVariance)) {
-                extrapolationWeight = std::min(longTermVariance / extrapolationVariance, 1.0);
+                // Preserve extrapolation while its uncertainty is comparable to
+                // the variation observed in the series.
+                extrapolationWeight =
+                    std::sqrt(std::min(2.0 * longTermVariance / extrapolationVariance, 1.0));
                 extrapolationWeight = std::isfinite(extrapolationWeight) ? extrapolationWeight
                                                                          : 0.0;
             }
