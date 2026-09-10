@@ -569,6 +569,13 @@ void CTrendComponent::forecast(core_t::TTime startTime,
     CForecastLevel level{m_ProbabilityOfLevelChangeModel,
                          m_MagnitudeOfLevelChangeModel, m_TimeOfLastLevelChange};
 
+    double longTermVariance{common::CBasicStatistics::variance(m_ValueMoments)};
+    TDoubleVec startModelWeights{modelWeights};
+    for (std::size_t j = 0; j < NUMBER_MODELS; ++j) {
+        startModelWeights[j] *= factors[j];
+    }
+    double startPrediction{this->value(startModelWeights, models,
+                                       scaleTime(startTime, m_RegressionOrigin))};
     TDoubleVec variances(NUMBER_MODELS + 1);
     for (core_t::TTime time = startTime; time < endTime; time += step) {
         double scaledDt{scaleTime(time, startTime)};
@@ -585,7 +592,22 @@ void CTrendComponent::forecast(core_t::TTime startTime,
         for (std::size_t j = 0; j < NUMBER_MODELS; ++j) {
             variances[j] = times.inner(modelCovariances[j] * times) + mse[j];
         }
-        variances[NUMBER_MODELS] = common::CBasicStatistics::variance(m_ValueMoments);
+        TMeanAccumulator extrapolationVarianceMoments;
+        for (std::size_t j = 0; j < NUMBER_MODELS; ++j) {
+            extrapolationVarianceMoments.add(variances[j], modelWeights[j]);
+        }
+        double extrapolationVariance{common::CBasicStatistics::mean(extrapolationVarianceMoments)};
+        // At long horizons the forecast weights shift towards slower models. Only
+        // use the trend they predict to the extent its extrapolation uncertainty is
+        // small compared to the variability we have observed. Falling back to the
+        // level at the start of the forecast avoids both unbounded polynomials and
+        // the surprising reversion to the historical mean of a genuine trend.
+        double extrapolationWeight{1.0};
+        if (extrapolationVariance > 0.0) {
+            extrapolationWeight = std::min(longTermVariance / extrapolationVariance, 1.0);
+        }
+
+        variances[NUMBER_MODELS] = longTermVariance;
         for (auto v = variances.rbegin(); v != variances.rend(); ++v) {
             *v = *std::min_element(variances.rbegin(), v + 1);
         }
@@ -594,12 +616,13 @@ void CTrendComponent::forecast(core_t::TTime startTime,
         for (std::size_t j = 0; j < NUMBER_MODELS; ++j) {
             variance_.add(variances[j], errorWeights[j]);
         }
-        double variance{a * common::CBasicStatistics::mean(variance_) +
-                        b * common::CBasicStatistics::variance(m_ValueMoments)};
+        double variance{a * common::CBasicStatistics::mean(variance_) + b * longTermVariance};
 
-        TVector2x1 trend{confidenceInterval(
-            this->value(modelWeights, models, scaleTime(time, m_RegressionOrigin)),
-            variance, confidence)};
+        double prediction{this->value(modelWeights, models,
+                                      scaleTime(time, m_RegressionOrigin))};
+        prediction = extrapolationWeight * prediction +
+                     (1.0 - extrapolationWeight) * startPrediction;
+        TVector2x1 trend{confidenceInterval(prediction, variance, confidence)};
         TDouble3Vec seasonal_(seasonal(time));
         TDouble3Vec level_(level.forecast(time, seasonal_[1] + trend.mean(), confidence));
 
