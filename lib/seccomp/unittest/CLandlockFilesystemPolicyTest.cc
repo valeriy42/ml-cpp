@@ -11,6 +11,8 @@
 
 #include <seccomp/CLandlockFilesystemPolicy.h>
 
+#include <boost/filesystem.hpp>
+#include <boost/system/error_code.hpp>
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
@@ -34,6 +36,44 @@ BOOST_AUTO_TEST_CASE(testDescribeCoversEveryOutcome) {
     BOOST_TEST_REQUIRE(ml::seccomp::describe(ml::seccomp::ELandlockOutcome::E_Failed).empty() == false);
     BOOST_REQUIRE(ml::seccomp::describe(ml::seccomp::ELandlockOutcome::E_Applied) !=
                   ml::seccomp::describe(ml::seccomp::ELandlockOutcome::E_Failed));
+}
+
+// perChildIpcDirectory() is pure string logic, declared and defined inline in
+// the header, so it is testable on every platform without forking or
+// applying anything.
+BOOST_AUTO_TEST_CASE(testPerChildIpcDirectoryPositiveCases) {
+    using ml::seccomp::perChildIpcDirectory;
+
+    BOOST_REQUIRE_EQUAL(std::string{"/tmp/ml-child-ipc/dep-1"},
+                       perChildIpcDirectory("/tmp/ml-child-ipc/dep-1/logPipe"));
+    // A deeper trusted base directory - only the last three components
+    // matter.
+    BOOST_REQUIRE_EQUAL(std::string{"/var/lib/es/tmp/ml-child-ipc/abc123"},
+                       perChildIpcDirectory("/var/lib/es/tmp/ml-child-ipc/abc123/output"));
+}
+
+BOOST_AUTO_TEST_CASE(testPerChildIpcDirectoryNegativeCases) {
+    using ml::seccomp::perChildIpcDirectory;
+
+    // Empty input.
+    BOOST_TEST_REQUIRE(perChildIpcDirectory("").empty());
+
+    // Relative path: the Landlock rule must never depend on the process's
+    // working directory.
+    BOOST_TEST_REQUIRE(perChildIpcDirectory("ml-child-ipc/dep-1/logPipe").empty());
+
+    // Flat $TMPDIR layout (the legacy/non-per-child layout) - no
+    // "ml-child-ipc/<id>" shape at all.
+    BOOST_TEST_REQUIRE(perChildIpcDirectory("/tmp/logPipe").empty());
+
+    // Missing the <id> path component: the pipe sits directly under
+    // ".../ml-child-ipc" rather than under a per-child subdirectory of it.
+    BOOST_TEST_REQUIRE(perChildIpcDirectory("/tmp/ml-child-ipc/logPipe").empty());
+
+    // A parent directory that merely ends in "ml-child-ipc" (e.g.
+    // "xml-child-ipc") must NOT match - the comparison must be exact, not a
+    // suffix match.
+    BOOST_TEST_REQUIRE(perChildIpcDirectory("/tmp/xml-child-ipc/dep-1/logPipe").empty());
 }
 
 #ifdef Linux
@@ -259,6 +299,93 @@ BOOST_AUTO_TEST_CASE(testPytorchInferencePathsAreTheMeasuredMinimum) {
         BOOST_TEST_REQUIRE(contains(paths.s_ReadOnly, tooBroad) == false);
         BOOST_TEST_REQUIRE(contains(paths.s_PipeDirectories, tooBroad) == false);
     }
+}
+
+BOOST_AUTO_TEST_CASE(testRealPytorchPolicyDeniesTheExploitTargetWrite) {
+    // End-to-end at the policy level, using the exact ruleset
+    // pytorch_inference installs on the Landlock fallback route - not a
+    // synthetic one. The attack-defense exploit model
+    // (test/evil_model_generator.py) writes an -agentpath payload to
+    // /usr/share/elasticsearch/config/jvm.options.d/gc.options; that path is
+    // outside every grant pytorchInferenceLandlockPaths() produces, so the
+    // real policy must deny a write there, while the per-child IPC directory
+    // it does grant stays usable for what pytorch_inference actually does
+    // there - create its own log FIFO. The grant is pipe-only (it may hold
+    // nothing but this process's own FIFOs - see
+    // SLandlockPaths::s_PipeDirectories), so unlike the original version of
+    // this test, the positive half below uses mkfifo/open/unlink rather than
+    // creating a regular file, which the real policy now refuses even inside
+    // the granted directory. This is the same boundary the harness's ROP
+    // exploit exercises, proven deterministically without a build-fragile ROP
+    // chain.
+    const std::string scratch{makeScratchDirectory()};
+    BOOST_TEST_REQUIRE(scratch.empty() == false);
+
+    // A stand-in for the operator TMPDIR, with the per-child IPC directory
+    // laid out as the controller creates it: <tmp>/ml-child-ipc/<child-id>.
+    const std::string ipcDir{scratch + "/ml-child-ipc/dep-e2e"};
+    boost::system::error_code mkdirError;
+    boost::filesystem::create_directories(ipcDir, mkdirError);
+    BOOST_TEST_REQUIRE(mkdirError.value() == 0);
+
+    // The exploit's hard-coded target, created here so the difference the
+    // test observes is Landlock denying the write - not the parent directory
+    // being absent. Its parent is deliberately outside every grant.
+    const std::string forbiddenDir{scratch + "/config/jvm.options.d"};
+    boost::filesystem::create_directories(forbiddenDir, mkdirError);
+    BOOST_TEST_REQUIRE(mkdirError.value() == 0);
+    const std::string forbiddenTarget{forbiddenDir + "/gc.options"};
+
+    const int childResult{runInChild([&] {
+        ml::seccomp::SLandlockPaths paths{
+            ml::seccomp::pytorchInferenceLandlockPaths(ipcDir)};
+        // Point the "config" grant nowhere near forbiddenTarget: the real
+        // policy grants /etc etc., none of which cover this scratch config
+        // path, so no extra removal is needed - forbiddenTarget is already
+        // outside paths. Apply the real ruleset unchanged.
+        const ml::seccomp::ELandlockOutcome outcome{
+            ml::seccomp::applyLandlockFilesystemPolicy(paths)};
+        if (outcome == ml::seccomp::ELandlockOutcome::E_Unsupported) {
+            return static_cast<int>(E_ChildNotApplied);
+        }
+        if (outcome != ml::seccomp::ELandlockOutcome::E_Applied) {
+            return static_cast<int>(E_ChildGrantedPathUnreadable);
+        }
+
+        // The per-child IPC directory the real policy grants must stay
+        // usable for what pytorch_inference actually does there: mkfifo,
+        // open, unlink - exactly what CNamedPipeFactory does. A regular file
+        // is no longer valid here, since the grant is pipe-only.
+        const std::string fifoStandin{ipcDir + "/logPipe.test"};
+        if (::mkfifo(fifoStandin.c_str(), 0600) != 0) {
+            return static_cast<int>(E_ChildGrantedDirNotWritable);
+        }
+        const int okFd{::open(fifoStandin.c_str(), O_RDWR)};
+        if (okFd < 0) {
+            return static_cast<int>(E_ChildGrantedDirNotWritable);
+        }
+        ::close(okFd);
+        if (::unlink(fifoStandin.c_str()) != 0) {
+            return static_cast<int>(E_ChildGrantedDirNotWritable);
+        }
+
+        // The exploit's target write must be denied by the real policy.
+        const int deniedFd{::open(forbiddenTarget.c_str(), O_CREAT | O_WRONLY, 0600)};
+        if (deniedFd >= 0) {
+            ::close(deniedFd);
+            return static_cast<int>(E_ChildDeniedPathStillReadable);
+        }
+        return static_cast<int>(E_ChildOk);
+    })};
+
+    boost::system::error_code rmError;
+    boost::filesystem::remove_all(scratch, rmError);
+
+    if (childResult == E_ChildNotApplied) {
+        BOOST_TEST_MESSAGE("Landlock unsupported on this kernel - skipping");
+        return;
+    }
+    BOOST_REQUIRE_EQUAL(childResult, static_cast<int>(E_ChildOk));
 }
 
 #endif // Linux
