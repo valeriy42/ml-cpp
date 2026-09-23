@@ -251,6 +251,7 @@ BOOST_AUTO_TEST_CASE(testPytorchInferencePathsAreTheMeasuredMinimum) {
     // Sensitive trees are granted as exact files, never as directories.
     BOOST_TEST_REQUIRE(contains(paths.s_ReadOnly, "/proc/cpuinfo"));
     BOOST_TEST_REQUIRE(contains(paths.s_ReadOnly, "/proc/self/statm"));
+    BOOST_TEST_REQUIRE(contains(paths.s_ReadOnly, "/proc/self/environ"));
     BOOST_TEST_REQUIRE(contains(paths.s_ReadOnly, "/etc/localtime"));
     for (const char* tooBroad : {"/", "/proc", "/proc/self", "/etc", "/tmp", "/app/tmp",
                                  "/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr",

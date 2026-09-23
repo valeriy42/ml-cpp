@@ -218,9 +218,19 @@ SLandlockPaths pytorchInferenceLandlockPaths(const std::string& ipcDirectory) {
     paths.s_ReadOnly.push_back("/proc/cpuinfo");
 
     // The periodic memory reporter reads resident set size from here. Only
-    // this file: granting /proc/self would also expose environ, maps and fd,
-    // and granting /proc would expose every other process's.
+    // exact /proc/self files are granted: /proc/self as a directory would
+    // also expose maps, fd and the rest, and /proc would expose every other
+    // process's.
     paths.s_ReadOnly.push_back("/proc/self/statm");
+
+    // Read once after the ruleset applies (by a runtime library parsing its
+    // environment settings). Granting it gives an attacker nothing new: it is
+    // this process's own initial environment, which Elasticsearch's Spawner
+    // reduces to TMPDIR. Denying it had no measurable effect in the traced
+    // runs, but a denied config read is the silent-behaviour-change class that
+    // /proc/cpuinfo demonstrated - an MKL_* or OMP_* variable would be quietly
+    // ignored - so the denial would cost risk and buy no protection.
+    paths.s_ReadOnly.push_back("/proc/self/environ");
 
     // glibc loads the timezone lazily, on the first localtime() call, which
     // happens after the ruleset is applied. Denying it only makes log
