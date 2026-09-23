@@ -93,6 +93,39 @@ std::string describe(ELandlockOutcome outcome);
 //! ruleset and restricts nothing.
 int landlockAbiVersion();
 
+//! The per-child IPC directory that holds \p logPipePath, i.e. the path with
+//! its last component removed, provided that directory has the shape
+//! .../ml-child-ipc/<deployment-id>. Empty for anything else - in particular
+//! the legacy flat layout, where the pipes sit directly in the shared
+//! $TMPDIR. The Landlock pipe-directory grant includes unlinking, so it may
+//! only ever be given to a directory that holds nothing but this process's
+//! own pipes; callers must refuse to confine (and must not run) otherwise.
+inline std::string perChildIpcDirectory(const std::string& logPipePath) {
+    static const std::string PER_CHILD_PARENT{"ml-child-ipc"};
+    // Absolute only: a relative path would make the Landlock rule depend on
+    // the process's working directory. Elasticsearch always sends absolute
+    // pipe paths.
+    if (logPipePath.empty() || logPipePath[0] != '/') {
+        return std::string{};
+    }
+    const std::size_t fileSlash{logPipePath.rfind('/')};
+    if (fileSlash == std::string::npos || fileSlash == 0) {
+        return std::string{};
+    }
+    const std::string directory{logPipePath.substr(0, fileSlash)};
+    const std::size_t idSlash{directory.rfind('/')};
+    if (idSlash == std::string::npos || idSlash + 1 == directory.size()) {
+        return std::string{};
+    }
+    const std::size_t parentSlash{directory.rfind('/', idSlash - 1)};
+    const std::size_t parentStart{parentSlash == std::string::npos ? 0 : parentSlash + 1};
+    if (idSlash == 0 || directory.compare(parentStart, idSlash - parentStart, PER_CHILD_PARENT) != 0 ||
+        idSlash - parentStart != PER_CHILD_PARENT.size()) {
+        return std::string{};
+    }
+    return directory;
+}
+
 //! The paths pytorch_inference needs, derived from its own resolved binary
 //! location and the directory its IPC pipes live in.
 //!

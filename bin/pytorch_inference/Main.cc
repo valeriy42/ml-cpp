@@ -110,6 +110,38 @@ void verifySafeModelBeforeLoad(const char* modelData, std::size_t modelSize) {
 }
 }
 
+namespace {
+//! Apply the Landlock ruleset for the Landlock rung. Returns false, after
+//! logging why, if this process must not go on to handle untrusted input.
+bool confineFilesystem(const std::string& logPipePath) {
+    const std::string ipcDirectory{ml::seccomp::perChildIpcDirectory(logPipePath)};
+    if (ipcDirectory.empty()) {
+        // The grant includes unlinking pipes; in the legacy flat $TMPDIR that
+        // would let this sandboxee delete another deployment's pipes. The
+        // controller only adds --restrictFilesystem alongside the per-child
+        // layout, so this is a caller bug - fail closed.
+        LOG_FATAL(<< "--restrictFilesystem requires the per-child IPC directory layout "
+                     "($TMPDIR/ml-child-ipc/<deployment-id>/), but the log pipe is '"
+                  << logPipePath << "'; refusing to process untrusted model input");
+        return false;
+    }
+    const ml::seccomp::ELandlockOutcome outcome{ml::seccomp::applyLandlockFilesystemPolicy(
+        ml::seccomp::pytorchInferenceLandlockPaths(ipcDirectory))};
+    if (outcome != ml::seccomp::ELandlockOutcome::E_Applied) {
+        // Should not happen: the controller only chooses this rung after
+        // confirming Landlock is available. Fail closed anyway - running on
+        // would serve untrusted model code with no filesystem boundary while
+        // the controller's sandbox2_launch signal says one is in force.
+        LOG_FATAL(<< "Landlock filesystem confinement " << ml::seccomp::describe(outcome)
+                  << "; refusing to process untrusted model input. If this host cannot "
+                     "support Landlock, deactivate the xpack.ml.trained_models.sandbox_enabled "
+                     "setting to run models without a sandbox");
+        return false;
+    }
+    return true;
+}
+}
+
 torch::Tensor infer(torch::jit::script::Module& module_,
                     ml::torch::CCommandParser::SRequest& request) {
 
@@ -310,57 +342,19 @@ int main(int argc, char** argv) {
     // Reduce memory priority before installing system call filters.
     ml::core::CProcessPriority::reduceMemoryPriority();
 
-    // Filesystem confinement for the Landlock fallback route: the
-    // controller asks for this when Elasticsearch requested Sandbox2 but the
-    // host forbids the user namespaces Sandbox2 needs, so the mount
-    // namespace and pivot_root that would normally bound this process are
-    // unavailable. Applied here - after logging is up so a failure is
-    // visible, after the seccomp filter so the two compose, and before any
-    // model bytes are read - because the ruleset is irreversible and must
-    // already be in force when untrusted TorchScript is deserialized.
-    //
-    // Deliberately weaker than the Sandbox2 route and never a substitute for
-    // it: Landlock bounds which paths can be opened, not what the process
-    // can see. The process table, the mount table and the network namespace
-    // are all still the host's.
-    if (restrictFilesystem) {
-        // The IPC directory is the one writable location the sandboxee
-        // needs; derive it from the log pipe, which is the one path option
-        // Elasticsearch always sends.
-        std::string ipcDirectory;
-        const std::size_t lastSlash{logFileName.rfind('/')};
-        if (lastSlash != std::string::npos && lastSlash > 0) {
-            ipcDirectory = logFileName.substr(0, lastSlash);
-        }
-        // The pipe-directory grant includes unlinking. In a per-child
-        // directory that only ever holds this process's own pipes; in the
-        // legacy flat $TMPDIR it would let one sandboxee delete another
-        // deployment's pipes. Elasticsearch always uses the per-child layout
-        // on this route, so anything else is a caller bug - fail closed.
-        const std::size_t parentSlash{ipcDirectory.rfind('/')};
-        const std::string parent{parentSlash == std::string::npos
-                                     ? std::string{}
-                                     : ipcDirectory.substr(0, parentSlash)};
-        if (parent.size() < 13 || parent.compare(parent.size() - 13, 13, "/ml-child-ipc") != 0) {
-            LOG_FATAL(<< "--restrictFilesystem requires the per-child IPC directory layout "
-                         "($TMPDIR/ml-child-ipc/<deployment-id>/), but the log pipe is '"
-                      << logFileName << "'; refusing to process untrusted model input");
-            return EXIT_FAILURE;
-        }
-        const ml::seccomp::ELandlockOutcome landlockOutcome{
-            ml::seccomp::applyLandlockFilesystemPolicy(
-                ml::seccomp::pytorchInferenceLandlockPaths(ipcDirectory))};
-        if (landlockOutcome != ml::seccomp::ELandlockOutcome::E_Applied) {
-            // Fail closed: --restrictFilesystem is only ever sent because the
-            // operator asked for a sandbox and this is the strongest one the
-            // host can provide. Running on without it would serve untrusted
-            // model code with no filesystem boundary at all while the
-            // controller's signal claims one is in force.
-            LOG_FATAL(<< "Landlock filesystem confinement "
-                      << ml::seccomp::describe(landlockOutcome)
-                      << "; refusing to process untrusted model input");
-            return EXIT_FAILURE;
-        }
+    // Filesystem confinement on the Landlock rung: the controller adds
+    // --restrictFilesystem when Elasticsearch asked for a sandbox but this
+    // host cannot run Sandbox2 (see CProcessSpawnerRouter). Ordering is
+    // load-bearing, and deliberate:
+    //  - after the logger is reconfigured, so a failure here is visible;
+    //  - BEFORE the in-process seccomp filter below, because that filter's
+    //    allowlist does not permit the Landlock syscalls - installing it
+    //    first makes landlock_create_ruleset() fail with EACCES;
+    //  - before any model bytes are read, because the ruleset is
+    //    irreversible and must already be in force when untrusted
+    //    TorchScript (including __setstate__) is deserialized.
+    if (restrictFilesystem && confineFilesystem(logFileName) == false) {
+        return EXIT_FAILURE;
     }
 
     // Internal switch, deliberately still OFF (log-and-continue on a failed
@@ -396,9 +390,13 @@ int main(int argc, char** argv) {
     // legacy-route attestation marker on a launch the controller's
     // sandbox2_launch signal reports as "route":"sandbox2".
     const bool sandbox2Launched{ml::seccomp::sandbox2LaunchedChild()};
+    // The same filter is installed on the Landlock rung - Landlock and seccomp
+    // are meant to stack - so its attestation names that route, matching the
+    // controller's sandbox2_launch signal for this launch.
     const ml::seccomp::SInProcessFilterResult seccompResult{ml::seccomp::applyInProcessSeccompFilter(
         sandbox2Launched, TERMINATE_ON_DEGRADED_SECCOMP_FAILURE,
-        [] { return ml::seccomp::CSystemCallFilter::installSystemCallFilter(); })};
+        [] { return ml::seccomp::CSystemCallFilter::installSystemCallFilter(); },
+        restrictFilesystem ? "landlock" : "legacy")};
 
     if (seccompResult.s_Attempted == false) {
         LOG_DEBUG(<< "ML_SANDBOXED=1: skipping in-process system call filter "
@@ -415,18 +413,7 @@ int main(int argc, char** argv) {
     // of a fatal log line above. Empty (never emitted) on the Sandbox2
     // route, which installs no in-process filter to attest.
     if (seccompResult.s_AttestationMarker.empty() == false) {
-        // The marker names the route this filter belongs to. On the Landlock
-        // route the same in-process filter is installed - Landlock and
-        // seccomp are meant to stack - but reporting it as "legacy" would
-        // contradict the controller's sandbox2_launch signal (mode
-        // "landlock") for the same launch.
-        std::string marker{seccompResult.s_AttestationMarker};
-        const std::string legacyRoute{"\"ml_sandbox2_route\":\"legacy\""};
-        const std::size_t pos{marker.find(legacyRoute)};
-        if (restrictFilesystem && pos != std::string::npos) {
-            marker.replace(pos, legacyRoute.size(), "\"ml_sandbox2_route\":\"landlock\"");
-        }
-        LOG_INFO(<< marker);
+        LOG_INFO(<< seccompResult.s_AttestationMarker);
     }
 
     if (ioMgr.initIo() == false) {

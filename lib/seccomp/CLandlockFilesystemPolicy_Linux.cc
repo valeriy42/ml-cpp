@@ -12,6 +12,7 @@
 
 #include <core/CLogger.h>
 
+#include <climits>
 #include <cstdint>
 #include <cstring>
 

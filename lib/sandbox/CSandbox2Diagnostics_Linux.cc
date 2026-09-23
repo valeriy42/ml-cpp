@@ -62,10 +62,105 @@ ESandbox2Capability sandbox2Capability() {
     return capability;
 }
 
+EConfinementLevel decideConfinement(ESandbox2Capability sandbox2, int landlockAbi) {
+    if (sandbox2 == ESandbox2Capability::E_Available) {
+        return EConfinementLevel::E_Sandbox2;
+    }
+    // A build without Sandbox2 never reaches the sandboxed route (the router
+    // refuses it outright), so it is never offered the Landlock rung either.
+    if (sandbox2 == ESandbox2Capability::E_ProbeUnsupported) {
+        return EConfinementLevel::E_Unavailable;
+    }
+    // Any Sandbox2 denial - including E_ProbeFailed, where attempting
+    // Sandbox2 anyway could deadlock in the forkserver's namespace setup -
+    // steps down to Landlock if the kernel supports it.
+    return landlockAbi >= 1 ? EConfinementLevel::E_Landlock : EConfinementLevel::E_Unavailable;
+}
+
+std::string describeLandlock(int landlockAbi) {
+    if (landlockAbi >= 1) {
+        return "available (ABI " + std::to_string(landlockAbi) + ")";
+    }
+    if (landlockAbi == 0) {
+        return "not supported by this kernel";
+    }
+    return "blocked by a seccomp filter or LSM policy";
+}
+
+std::string fullSandboxRemedy(const SHostConfinement& host) {
+    switch (host.s_Sandbox2) {
+    case ESandbox2Capability::E_Available:
+        return std::string{};
+    case ESandbox2Capability::E_UserNamespaceDenied:
+        if (host.s_UnprivilegedUsernsClone == "0") {
+            return "For full Sandbox2 isolation, a system administrator must allow unprivileged "
+                   "user namespaces by setting the kernel parameter "
+                   "kernel.unprivileged_userns_clone=1 (for example with "
+                   "'sysctl -w kernel.unprivileged_userns_clone=1', persisted in /etc/sysctl.d/).";
+        }
+        if (host.s_MaxUserNamespaces == "0") {
+            return "For full Sandbox2 isolation, a system administrator must allow user "
+                   "namespaces by setting the kernel parameter user.max_user_namespaces to a "
+                   "non-zero value.";
+        }
+        return "For full Sandbox2 isolation, a system administrator must allow unprivileged "
+               "user namespaces for this process. The kernel permits them "
+               "(kernel.unprivileged_userns_clone is not 0), so they are being blocked by the "
+               "container runtime - typically a seccomp profile that denies clone/unshare with "
+               "CLONE_NEWUSER.";
+    case ESandbox2Capability::E_IdMapWriteDenied:
+    case ESandbox2Capability::E_MountOrPidNamespaceDenied:
+        return "For full Sandbox2 isolation, a system administrator must allow this process "
+               "to set up user, mount and PID namespaces; user namespaces can be created, but "
+               "the container runtime blocks the later steps.";
+    case ESandbox2Capability::E_TmpfsMountDenied:
+        return "For full Sandbox2 isolation, a system administrator must allow mounts inside "
+               "unprivileged user namespaces for this process; they are currently denied, "
+               "typically by an AppArmor or SELinux policy.";
+    case ESandbox2Capability::E_ProcMountDenied:
+        return "For full Sandbox2 isolation, a system administrator must allow this process "
+               "to mount a private /proc; the container runtime currently masks parts of /proc, "
+               "which makes the kernel refuse it.";
+    case ESandbox2Capability::E_ProbeFailed:
+        return "The Sandbox2 capability probe itself could not run, so the reason is unknown; "
+               "see the earlier ML controller log messages.";
+    case ESandbox2Capability::E_ProbeUnsupported:
+        return "This build does not include Sandbox2.";
+    }
+    return std::string{};
+}
+
+std::string landlockFallbackMessage(const SHostConfinement& host, const std::string& processPath) {
+    return "Full Sandbox2 isolation is not available on this host (" + describe(host.s_Sandbox2) +
+           "), so '" + processPath +
+           "' is being launched with Landlock filesystem confinement and the seccomp system "
+           "call filter instead. Landlock restricts which files the process can open but, "
+           "unlike Sandbox2, does not isolate its view of processes, mounts or the network. " +
+           fullSandboxRemedy(host);
+}
+
+std::string noConfinementMessage(const SHostConfinement& host, const std::string& processPath) {
+    const std::string why{host.s_LandlockAbi == 0
+                              ? "the operating system is too old or its kernel lacks the required "
+                                "features (Landlock needs Linux 5.13 or later)"
+                              : "Landlock is " + describeLandlock(host.s_LandlockAbi)};
+    return "Refusing to launch '" + processPath +
+           "': xpack.ml.trained_models.sandbox_enabled is true, but this host supports neither "
+           "Sandbox2 isolation (" + describe(host.s_Sandbox2) + ") nor Landlock filesystem "
+           "confinement - " + why + ". To run models on this node, deactivate the "
+           "xpack.ml.trained_models.sandbox_enabled setting (set it to false); models then run "
+           "with the seccomp system call filter only.";
+}
+
 #if !defined(__linux__) || !defined(SANDBOX2_AVAILABLE)
 
 ESandbox2Capability probeSandbox2Capability() {
     return ESandbox2Capability::E_ProbeUnsupported;
+}
+
+const SHostConfinement& hostConfinement() {
+    static const SHostConfinement host{};
+    return host;
 }
 
 void logSandbox2EnvironmentSelfCheck() {
@@ -290,6 +385,21 @@ ESandbox2Capability probeSandbox2Capability() {
     return capabilityFromExit(WEXITSTATUS(status));
 }
 
+const SHostConfinement& hostConfinement() {
+    static const SHostConfinement host{[] {
+        SHostConfinement h;
+        h.s_Sandbox2 = sandbox2Capability();
+        h.s_LandlockAbi = seccomp::landlockAbiVersion();
+        const std::string userns{readProcSysValue("/proc/sys/kernel/unprivileged_userns_clone")};
+        const std::string maxUserns{readProcSysValue("/proc/sys/user/max_user_namespaces")};
+        h.s_UnprivilegedUsernsClone = userns.empty() ? "absent" : userns;
+        h.s_MaxUserNamespaces = maxUserns.empty() ? "absent" : maxUserns;
+        h.s_Level = decideConfinement(h.s_Sandbox2, h.s_LandlockAbi);
+        return h;
+    }()};
+    return host;
+}
+
 void logSandbox2EnvironmentSelfCheck() {
     static bool logged{false};
     if (logged) {
@@ -297,60 +407,45 @@ void logSandbox2EnvironmentSelfCheck() {
     }
     logged = true;
 
-    const ESandbox2Capability capability{sandbox2Capability()};
+    const SHostConfinement& host{hostConfinement()};
 
-    // Passive host facts alongside the active result. These are what the
-    // frozen prior art (ml-cpp#2873's CSandbox2Diagnostics) reported on its
-    // own; they are kept because they help interpret a denial, but they are
-    // deliberately no longer the answer: both sysctls below are host-global
-    // and are inherited unchanged by a container whose seccomp or LSM policy
-    // denies the operation anyway, so on their own they report a healthy
-    // environment on exactly the hosts where the sandbox cannot start.
-    std::string usernsSysctl{readProcSysValue("/proc/sys/kernel/unprivileged_userns_clone")};
-    if (usernsSysctl.empty()) {
-        usernsSysctl = "absent";
-    }
-    std::string maxUserNamespaces{readProcSysValue("/proc/sys/user/max_user_namespaces")};
-    if (maxUserNamespaces.empty()) {
-        maxUserNamespaces = "absent";
-    }
-
+    // The passive sysctl values are what the frozen prior art (ml-cpp#2873's
+    // CSandbox2Diagnostics) reported on its own. They never decide anything
+    // - both are host-global and are inherited unchanged by a container whose
+    // seccomp or LSM policy denies user namespaces regardless - but they are
+    // what tells an administrator which knob to turn.
     const char* tmpDirEnv{::getenv("TMPDIR")};
     const std::string tmpDir{tmpDirEnv != nullptr ? tmpDirEnv : "/tmp"};
-
-    // Whether the Landlock fallback can run here. Reported on every node,
-    // not only when Sandbox2 is unavailable: an operator evaluating the
-    // fallback wants to know in advance, and on a capable host it is still
-    // useful to know which boundary a future kernel or runtime change would
-    // leave available.
-    const int landlockAbi{seccomp::landlockAbiVersion()};
-    std::string landlockStatus;
-    if (landlockAbi >= 1) {
-        landlockStatus = "available (ABI " + std::to_string(landlockAbi) + ")";
-    } else if (landlockAbi == 0) {
-        landlockStatus = "unsupported by this kernel";
-    } else {
-        landlockStatus = "denied by a seccomp filter or LSM";
-    }
-
-    const std::string message{
-        "Sandbox2 environment self-check: capability=" + describe(capability) +
-        ", landlock=" + landlockStatus +
-        ", unprivileged_userns_clone=" + usernsSysctl +
-        ", max_user_namespaces=" + maxUserNamespaces + ", TMPDIR=" + tmpDir +
+    const std::string facts{
+        "Sandbox2 environment self-check: sandbox2=" + describe(host.s_Sandbox2) +
+        ", landlock=" + describeLandlock(host.s_LandlockAbi) +
+        ", unprivileged_userns_clone=" + host.s_UnprivilegedUsernsClone +
+        ", max_user_namespaces=" + host.s_MaxUserNamespaces + ", TMPDIR=" + tmpDir +
         ", TMPDIR writable=" + (::access(tmpDir.c_str(), W_OK) == 0 ? "yes" : "no") +
         ", TMPDIR noexec=" + (pathHasNoexecFlag(tmpDir.c_str()) ? "yes" : "no")};
 
-    if (capability == ESandbox2Capability::E_Available) {
-        LOG_INFO(<< message);
-    } else {
-        // Not fatal and not a launch failure: the controller only fails a
-        // launch if Elasticsearch actually asks for the Sandbox2 route. A
-        // node that never sets sandbox_enabled=true runs unaffected, so this
-        // is a warning about what *would* happen, not an error that happened.
-        LOG_WARN(<< message << " - a --requireSandbox launch on this host will "
-                 << (landlockAbi >= 1 ? "fall back to Landlock filesystem confinement"
-                                      : "fail closed"));
+    // Logged at controller start, before any launch, and regardless of
+    // xpack.ml.trained_models.sandbox_enabled (which the controller only
+    // learns per launch) - so each message says what *would* happen if the
+    // setting is true.
+    switch (host.s_Level) {
+    case EConfinementLevel::E_Sandbox2:
+        LOG_INFO(<< facts << ". Models launched with xpack.ml.trained_models.sandbox_enabled=true "
+                            "will run with full Sandbox2 isolation.");
+        break;
+    case EConfinementLevel::E_Landlock:
+        // A supported, deliberate degradation - INFO, not WARN.
+        LOG_INFO(<< facts << ". Models launched with xpack.ml.trained_models.sandbox_enabled=true "
+                            "will run with Landlock filesystem confinement, because full Sandbox2 "
+                            "isolation is not available on this host. "
+                 << fullSandboxRemedy(host));
+        break;
+    case EConfinementLevel::E_Unavailable:
+        LOG_WARN(<< facts << ". This host supports neither Sandbox2 nor Landlock, so every model "
+                            "deployment on this node will fail to start while "
+                            "xpack.ml.trained_models.sandbox_enabled is true; deactivate that "
+                            "setting (set it to false) to run models here.");
+        break;
     }
 }
 

@@ -130,8 +130,15 @@ namespace ml {
 namespace controller {
 
 CProcessSpawnerRouter::CProcessSpawnerRouter(const TStrVec& permittedProcessPaths,
-                                             const TStrVec& sandboxedProcessPaths)
-    : m_LegacySpawner{permittedProcessPaths}, m_SandboxedProcessPaths{sandboxedProcessPaths} {
+                                             const TStrVec& sandboxedProcessPaths,
+                                             TConfinementFn confinementFn)
+    : m_LegacySpawner{permittedProcessPaths}, m_SandboxedProcessPaths{sandboxedProcessPaths},
+      m_ConfinementFn{confinementFn ? std::move(confinementFn)
+                                    : TConfinementFn{[] { return sandbox::hostConfinement(); }}} {
+}
+
+const std::string& CProcessSpawnerRouter::lastSpawnFailureReason() const {
+    return m_LastSpawnFailureReason;
 }
 
 bool CProcessSpawnerRouter::isSandboxedProcessPath(const std::string& processPath) const {
@@ -234,6 +241,7 @@ bool CProcessSpawnerRouter::spawn(ERoute route,
     const std::string deploymentId{sandboxEligible ? deriveDeploymentId(args)
                                                    : std::string()};
 
+    m_LastSpawnFailureReason.clear();
     bool spawned{false};
     // Set when the Sandbox2 route degraded to the Landlock fallback, so the
     // signal below reports what actually bounded the child.
@@ -255,51 +263,54 @@ bool CProcessSpawnerRouter::spawn(ERoute route,
     // route == ERoute::E_Sandbox2, and processPath is configured as
     // sandboxed.
 #ifdef SANDBOX2_AVAILABLE
-        // First - and only - point at which any Sandbox2 machinery is
-        // constructed. A router that never reaches this branch (every
-        // router that never dispatches a validated --requireSandbox token,
-        // and every router in a build without Sandbox2 support) never creates a
-        // CSandboxedProcessSpawner at all, so no Sandbox2 state enters its
-        // construction or teardown path. Single-threaded by the same
-        // contract as the legacy spawner - see the member's declaration.
-        // Probing before constructing anything: on a host that forbids the
-        // user namespaces the Sandbox2 forkserver needs, every launch would
-        // otherwise fail with an opaque SETUP_ERROR/FAILED_SUBPROCESS, or -
-        // in the case where namespaces are permitted but mounting a tmpfs
-        // inside one is not - deadlock in the forkserver's initial-namespace
-        // setup rather than returning at all. The probe is cheap (one forked
-        // child) and cached by the diagnostics layer's own one-shot log.
-        // The same cached verdict the startup self-check logged, never a
-        // second independent probe: two probes can disagree (one once did,
-        // when the controller's non-dumpable flag broke the later one), and
-        // then the log says one thing while the route does another.
-        const sandbox::ESandbox2Capability capability{sandbox::sandbox2Capability()};
-
-        if (capability == sandbox::ESandbox2Capability::E_Available) {
+        // Decide the rung before constructing or launching anything, from
+        // the one cached verdict the startup self-check also logged - never
+        // an independent probe here, because two probes can disagree (one
+        // once did, when the controller's non-dumpable flag broke the later
+        // one) and then the log says one thing while the route does
+        // another. Deciding first matters: on a host without user
+        // namespaces a Sandbox2 launch fails only after an opaque
+        // SETUP_ERROR, and on one that permits namespaces but denies mounts
+        // inside them the forkserver deadlocks instead of returning.
+        const sandbox::SHostConfinement host{m_ConfinementFn()};
+        switch (host.s_Level) {
+        case sandbox::EConfinementLevel::E_Sandbox2:
+            // First - and only - point at which any Sandbox2 machinery is
+            // constructed. A router that never reaches this case (every
+            // router that never dispatches a validated --requireSandbox
+            // token, every router on a host that cannot run Sandbox2, and
+            // every router in a build without Sandbox2 support) never creates
+            // a CSandboxedProcessSpawner at all, so no Sandbox2 state enters
+            // its construction or teardown path. Single-threaded by the same
+            // contract as the legacy spawner - see the member's declaration.
             if (m_SandboxSpawner == nullptr) {
                 m_SandboxSpawner = std::make_unique<sandbox::CSandboxedProcessSpawner>();
             }
-
-            // No automatic fallback to the legacy spawner on a Sandbox2
-            // failure: a process that must be sandboxed either
-            // launches inside Sandbox2 or does not launch at all.
+            // No automatic fallback on a Sandbox2 *failure*: a host that can
+            // run Sandbox2 but fails this launch has a problem worth
+            // surfacing, not papering over with a weaker boundary.
             spawned = m_SandboxSpawner->spawn(processPath, args, childPid);
-        } else {
-            // The host cannot run Sandbox2 at all. Rather than fail every
-            // deployment closed, launch via the legacy spawner with the
-            // strongest confinement this host *can* enforce: the in-process
-            // seccomp filter plus a Landlock filesystem ruleset, which needs
-            // no namespaces. This is strictly weaker than Sandbox2 - no
-            // process, mount or network isolation - so it is reported as its
-            // own mode, never as "enforced".
-            LOG_WARN(<< "Sandbox2 is unavailable on this host (" << sandbox::describe(capability)
-                     << "); launching '" << processPath
-                     << "' with Landlock filesystem confinement instead - this is weaker "
-                        "than Sandbox2 and provides no process, mount or network isolation");
+            break;
+        case sandbox::EConfinementLevel::E_Landlock: {
+            // A supported, deliberate degradation: INFO, with what an
+            // administrator would change to get full isolation.
+            LOG_INFO(<< sandbox::landlockFallbackMessage(host, processPath));
             TStrVec landlockArgs{args};
             landlockArgs.emplace_back(RESTRICT_FILESYSTEM_TOKEN);
             spawned = m_LegacySpawner.spawn(processPath, landlockArgs, childPid);
             landlockFallback = true;
+            break;
+        }
+        case sandbox::EConfinementLevel::E_Unavailable:
+            // Refuse here, in the controller, rather than launching a child
+            // that would only discover it cannot confine itself: that way
+            // Elasticsearch gets an immediate, explained failure instead of
+            // a pipe-connection timeout, and no untrusted model is ever
+            // started unconfined while the operator asked for a sandbox.
+            m_LastSpawnFailureReason = sandbox::noConfinementMessage(host, processPath);
+            LOG_ERROR(<< m_LastSpawnFailureReason);
+            spawned = false;
+            break;
         }
 #else
         // Build/deployment contradiction: processPath is configured as
