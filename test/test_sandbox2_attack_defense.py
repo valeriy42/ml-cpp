@@ -694,7 +694,25 @@ def send_inference_request_with_timeout(input_pipe_path, request, timeout=5):
 
 
 def generate_models(output_dir):
-    """Generate test models using the ported generator script."""
+    """Generate test models using the ported generator script.
+
+    If ML_EVIL_MODELS_DIR is set and already contains the three .pt files,
+    they are copied in instead of regenerated. This lets the harness run in
+    an environment that has the controller/pytorch_inference binaries but no
+    torch (e.g. inside the cloud-ess image, where the models are generated
+    once elsewhere and mounted in) - the models are plain TorchScript
+    archives, independent of where they were traced.
+    """
+    prebuilt = os.environ.get('ML_EVIL_MODELS_DIR')
+    if prebuilt:
+        names = ('model_benign.pt', 'model_exploit.pt', 'model_leak.pt')
+        if all((Path(prebuilt) / n).exists() for n in names):
+            for n in names:
+                shutil.copy(Path(prebuilt) / n, Path(output_dir) / n)
+            return
+        raise RuntimeError(
+            f"ML_EVIL_MODELS_DIR={prebuilt} set but does not contain all of {names}")
+
     script_dir = Path(__file__).parent
     generator_script = script_dir / 'evil_model_generator.py'
     project_root = script_dir.parent
@@ -857,21 +875,37 @@ def run_pytorch_case(controller, pytorch_bin, model_path, tmp_base, command_id, 
         # reaching the controller, or a route-decision regression) would
         # still show "no target file" - for the wrong reason. Fail loudly
         # here instead.
-        expected_route = 'legacy' if unsandboxed else 'sandbox2'
+        # A sandboxed case is meaningful evidence about the runtime boundary
+        # whether the controller enforced it via Sandbox2 (route "sandbox2")
+        # or, on a host that forbids the user namespaces Sandbox2 needs, via
+        # the Landlock filesystem fallback (route "landlock"). Both confine
+        # the child; the negative assertion below ("the malicious model's
+        # target file must not exist") is valid for either. Only the
+        # unconfined "legacy" route makes that assertion meaningless, so an
+        # unsandboxed case requires exactly "legacy" and a sandboxed case
+        # requires one of the two confined routes - never "legacy", which for
+        # a sandboxed case would mean the child was not confined at all.
+        confined_routes = ('sandbox2', 'landlock')
         actual_route = find_launch_route(controller, log_offset)
         if actual_route is None:
             result.fail(
                 "No sandbox2_launch signal observed on the controller log within "
                 f"{PID_DISCOVERY_TIMEOUT}s of a successful start response - cannot confirm "
-                f"this launch took the '{expected_route}' route; not asserting on target file")
+                "which route this launch took; not asserting on target file")
             controller.check_controller_logs()
             return result, reached, target_file_created, response, leaked_address_seen, pid
-        if actual_route != expected_route:
+        if unsandboxed:
+            route_ok = actual_route == 'legacy'
+            expected_desc = 'legacy'
+        else:
+            route_ok = actual_route in confined_routes
+            expected_desc = ' or '.join(confined_routes)
+        if not route_ok:
             result.fail(
                 f"Routing regression: controller's sandbox2_launch signal reports "
                 f"\"route\":\"{actual_route}\" but this case requires "
-                f"\"{expected_route}\". The child was not sandboxed as intended, so any "
-                f"target-file assertion below would prove nothing about Sandbox2; "
+                f"\"{expected_desc}\". The child was not confined as intended, so any "
+                f"target-file assertion below would prove nothing about the sandbox; "
                 f"not asserting on target file")
             controller.check_controller_logs()
             return result, reached, target_file_created, response, leaked_address_seen, pid

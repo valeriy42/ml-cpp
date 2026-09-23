@@ -200,6 +200,75 @@ BOOST_AUTO_TEST_CASE(testPytorchInferencePathsIncludeTheIpcDirectoryAsWritable) 
     BOOST_TEST_REQUIRE(contains(paths.s_ReadOnly, "/proc") == false);
 }
 
+BOOST_AUTO_TEST_CASE(testRealPytorchPolicyDeniesTheExploitTargetWrite) {
+    // End-to-end at the policy level, using the exact ruleset
+    // pytorch_inference installs on the Landlock fallback route - not a
+    // synthetic one. The attack-defense exploit model
+    // (test/evil_model_generator.py) writes an -agentpath payload to
+    // /usr/share/elasticsearch/config/jvm.options.d/gc.options; that path is
+    // outside every grant pytorchInferenceLandlockPaths() produces, so the
+    // real policy must deny a write there, while the per-child IPC directory
+    // it does grant stays writable (pytorch_inference creates its own log
+    // FIFO in it). This is the same boundary the harness's ROP exploit
+    // exercises, proven deterministically without a build-fragile ROP chain.
+    const std::string scratch{makeScratchDirectory()};
+    BOOST_TEST_REQUIRE(scratch.empty() == false);
+
+    // A stand-in for the operator TMPDIR, with the per-child IPC directory
+    // laid out as the controller creates it: <tmp>/ml-child-ipc/<child-id>.
+    const std::string ipcDir{scratch + "/ml-child-ipc/dep-e2e"};
+    BOOST_TEST_REQUIRE(::system(("mkdir -p " + ipcDir).c_str()) == 0);
+
+    // The exploit's hard-coded target, created here so the difference the
+    // test observes is Landlock denying the write - not the parent directory
+    // being absent. Its parent is deliberately outside every grant.
+    const std::string forbiddenDir{scratch + "/config/jvm.options.d"};
+    BOOST_TEST_REQUIRE(::system(("mkdir -p " + forbiddenDir).c_str()) == 0);
+    const std::string forbiddenTarget{forbiddenDir + "/gc.options"};
+
+    const int childResult{runInChild([&] {
+        ml::seccomp::SLandlockPaths paths{
+            ml::seccomp::pytorchInferenceLandlockPaths(ipcDir)};
+        // Point the "config" grant nowhere near forbiddenTarget: the real
+        // policy grants /etc etc., none of which cover this scratch config
+        // path, so no extra removal is needed - forbiddenTarget is already
+        // outside paths. Apply the real ruleset unchanged.
+        const ml::seccomp::ELandlockOutcome outcome{
+            ml::seccomp::applyLandlockFilesystemPolicy(paths)};
+        if (outcome == ml::seccomp::ELandlockOutcome::E_Unsupported) {
+            return static_cast<int>(E_ChildNotApplied);
+        }
+        if (outcome != ml::seccomp::ELandlockOutcome::E_Applied) {
+            return static_cast<int>(E_ChildGrantedPathUnreadable);
+        }
+
+        // The per-child IPC directory the real policy grants must stay
+        // writable - pytorch_inference creates its log FIFO there.
+        const std::string fifoStandin{ipcDir + "/logPipe.test"};
+        const int okFd{::open(fifoStandin.c_str(), O_CREAT | O_WRONLY, 0600)};
+        if (okFd < 0) {
+            return static_cast<int>(E_ChildGrantedDirNotWritable);
+        }
+        ::close(okFd);
+
+        // The exploit's target write must be denied by the real policy.
+        const int deniedFd{::open(forbiddenTarget.c_str(), O_CREAT | O_WRONLY, 0600)};
+        if (deniedFd >= 0) {
+            ::close(deniedFd);
+            return static_cast<int>(E_ChildDeniedPathStillReadable);
+        }
+        return static_cast<int>(E_ChildOk);
+    })};
+
+    ::system(("rm -rf " + scratch).c_str());
+
+    if (childResult == E_ChildNotApplied) {
+        BOOST_TEST_MESSAGE("Landlock unsupported on this kernel - skipping");
+        return;
+    }
+    BOOST_REQUIRE_EQUAL(childResult, static_cast<int>(E_ChildOk));
+}
+
 #endif // Linux
 
 BOOST_AUTO_TEST_SUITE_END()
