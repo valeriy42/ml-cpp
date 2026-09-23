@@ -112,6 +112,11 @@ public:
     //! emission.
     bool isSandboxedProcessPath(const std::string& processPath) const;
 
+    //! Token appended to a child's argv when the Sandbox2 route degrades to
+    //! the Landlock fallback, telling pytorch_inference to confine its own
+    //! filesystem access before reading any model bytes.
+    static const std::string RESTRICT_FILESYSTEM_TOKEN;
+
 private:
     //! Emit the `sandbox2_launch` structured once-per-launch signal for a
     //! Sandbox2-eligible spawn() call,
@@ -124,11 +129,16 @@ private:
     //!        once by spawn() *before* dispatch - never re-derived here, so
     //!        the value in this signal cannot disagree with the value the
     //!        dispatch decision was made against.
+    //! \param landlockFallback true when \p route was E_Sandbox2 but this
+    //!        host cannot run Sandbox2, so the child was launched via the
+    //!        legacy spawner under a Landlock ruleset instead. Reported as
+    //!        mode "landlock", never as "enforced".
     void emitLaunchSignal(ERoute route,
                           ELegacyReason legacyReason,
                           const std::string& deploymentId,
                           const TStrVec& args,
-                          bool spawnSucceeded) const;
+                          bool spawnSucceeded,
+                          bool landlockFallback) const;
 
 private:
     core::CDetachedProcessSpawner m_LegacySpawner;

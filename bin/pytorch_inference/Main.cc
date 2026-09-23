@@ -18,6 +18,7 @@
 #include <core/CStringUtils.h>
 #include <core/Concurrency.h>
 
+#include <seccomp/CLandlockFilesystemPolicy.h>
 #include <seccomp/CSystemCallFilter.h>
 
 #include <ver/CBuildInfo.h>
@@ -238,13 +239,15 @@ int main(int argc, char** argv) {
     bool lowPriority{false};
     bool useImmediateExecutor{false};
     bool skipModelValidation{false};
+    bool restrictFilesystem{false};
 
     if (ml::torch::CCmdLineParser::parse(
             argc, argv, modelId, namedPipeConnectTimeout, inputFileName,
             isInputFileNamedPipe, outputFileName, isOutputFileNamedPipe, restoreFileName,
             isRestoreFileNamedPipe, logFileName, logProperties, numThreadsPerAllocation,
             numAllocations, cacheMemorylimitBytes, validElasticLicenseKeyConfirmed,
-            lowPriority, useImmediateExecutor, skipModelValidation) == false) {
+            lowPriority, useImmediateExecutor, skipModelValidation,
+            restrictFilesystem) == false) {
         return EXIT_FAILURE;
     }
 
@@ -306,6 +309,44 @@ int main(int argc, char** argv) {
 
     // Reduce memory priority before installing system call filters.
     ml::core::CProcessPriority::reduceMemoryPriority();
+
+    // Filesystem confinement for the Landlock fallback route: the
+    // controller asks for this when Elasticsearch requested Sandbox2 but the
+    // host forbids the user namespaces Sandbox2 needs, so the mount
+    // namespace and pivot_root that would normally bound this process are
+    // unavailable. Applied here - after logging is up so a failure is
+    // visible, after the seccomp filter so the two compose, and before any
+    // model bytes are read - because the ruleset is irreversible and must
+    // already be in force when untrusted TorchScript is deserialized.
+    //
+    // Deliberately weaker than the Sandbox2 route and never a substitute for
+    // it: Landlock bounds which paths can be opened, not what the process
+    // can see. The process table, the mount table and the network namespace
+    // are all still the host's.
+    if (restrictFilesystem) {
+        // The IPC directory is the one writable location the sandboxee
+        // needs; derive it from the log pipe, which is the one path option
+        // Elasticsearch always sends.
+        std::string ipcDirectory{"/tmp"};
+        const std::size_t lastSlash{logFileName.rfind('/')};
+        if (lastSlash != std::string::npos && lastSlash > 0) {
+            ipcDirectory = logFileName.substr(0, lastSlash);
+        }
+        const ml::seccomp::ELandlockOutcome landlockOutcome{
+            ml::seccomp::applyLandlockFilesystemPolicy(
+                ml::seccomp::pytorchInferenceLandlockPaths(ipcDirectory))};
+        if (landlockOutcome != ml::seccomp::ELandlockOutcome::E_Applied) {
+            // Fail closed: --restrictFilesystem is only ever sent because the
+            // operator asked for a sandbox and this is the strongest one the
+            // host can provide. Running on without it would serve untrusted
+            // model code with no filesystem boundary at all while the
+            // controller's signal claims one is in force.
+            LOG_FATAL(<< "Landlock filesystem confinement "
+                      << ml::seccomp::describe(landlockOutcome)
+                      << "; refusing to process untrusted model input");
+            return EXIT_FAILURE;
+        }
+    }
 
     // Internal switch, deliberately still OFF (log-and-continue on a failed
     // in-process seccomp installation, exactly as before typed routing).

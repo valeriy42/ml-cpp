@@ -1,0 +1,102 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0 and the following additional limitation. Functionality enabled by the
+ * files subject to the Elastic License 2.0 may only be used in production when
+ * invoked by an Elasticsearch process with a license key installed that permits
+ * use of machine learning features. You may not use this file except in
+ * compliance with the Elastic License 2.0 and the foregoing additional
+ * limitation.
+ */
+#ifndef INCLUDED_ml_seccomp_CLandlockFilesystemPolicy_h
+#define INCLUDED_ml_seccomp_CLandlockFilesystemPolicy_h
+
+#include <string>
+#include <vector>
+
+namespace ml {
+namespace seccomp {
+
+//! \brief
+//! Filesystem confinement that does not require user namespaces.
+//!
+//! DESCRIPTION:\n
+//! seccomp-BPF cannot restrict which *paths* a process opens - its filter
+//! program sees only register values, never the pointed-to path string - so
+//! the legacy in-process filter leaves a sandboxee able to read and write
+//! anything its uid can reach. Sandbox2 closes that gap with a mount
+//! namespace and pivot_root, but creating one needs an unprivileged user
+//! namespace, which some hosts forbid outright
+//! (kernel.unprivileged_userns_clone=0, or a container runtime seccomp
+//! profile that denies CLONE_NEWUSER - see
+//! sandbox::probeSandbox2Capability()).
+//!
+//! Landlock is the kernel's answer to exactly that case: an unprivileged,
+//! self-applied filesystem access-control ruleset needing no capabilities and
+//! no namespaces. It gives the path confinement half of what the Sandbox2
+//! rootfs gives, and composes with the existing seccomp filter.
+//!
+//! IMPLEMENTATION DECISIONS:\n
+//! What Landlock does NOT provide, and must not be claimed for it: no process
+//! table isolation (the sandboxee still sees host PIDs through /proc unless a
+//! rule denies it), no private mount view (denied paths remain visible and
+//! enumerable, they just cannot be opened), no network namespace, and no
+//! effect on file descriptors that were already open when the ruleset was
+//! applied. It is strictly weaker than the Sandbox2 route and is a fallback
+//! for hosts that cannot run it, never a replacement.
+//!
+//! The Landlock UAPI headers are absent from the CI build image
+//! (docker.elastic.co/ml-dev/ml-linux-build is CentOS7-based), so the
+//! syscall numbers and structures are declared locally in the .cc, the same
+//! way CMlLegacyBpfSyscallAllowlist.h falls back to raw numbers for statx,
+//! rseq and clone3. Runtime ABI negotiation then decides which access rights
+//! this kernel understands, so a binary built anywhere runs correctly on any
+//! kernel.
+struct SLandlockPaths {
+    //! Directories and files the sandboxee may read and execute from, but
+    //! never modify - its own binary and library directories, the system
+    //! library directories the dynamic loader resolves through, and the
+    //! read-only system files libtorch consults.
+    std::vector<std::string> s_ReadOnly;
+
+    //! The single per-child IPC directory the sandboxee owns. Read, write,
+    //! and FIFO creation - pytorch_inference creates its own log pipe there.
+    std::vector<std::string> s_ReadWrite;
+};
+
+//! Outcome of applyLandlockFilesystemPolicy().
+enum class ELandlockOutcome {
+    //! The ruleset was applied; the process is now confined.
+    E_Applied,
+    //! This kernel has no Landlock support (the syscall returned ENOSYS, or
+    //! the LSM is not enabled in the bootloader's lsm= list).
+    E_Unsupported,
+    //! Landlock exists but the ruleset could not be built or applied.
+    E_Failed
+};
+
+//! Human-readable one-line form of \p outcome.
+std::string describe(ELandlockOutcome outcome);
+
+//! The paths pytorch_inference needs, derived from its own resolved binary
+//! location and the directory its IPC pipes live in.
+//!
+//! \param ipcDirectory the directory holding the --input/--output/--restore/
+//! --logPipe paths. On the isolated-child-IPC layout this is
+//! $TMPDIR/ml-child-ipc/<deployment-id>, which confines the sandboxee to its
+//! own deployment's pipes; on the legacy flat layout it is $TMPDIR itself,
+//! which is correspondingly weaker because every deployment shares it.
+SLandlockPaths pytorchInferenceLandlockPaths(const std::string& ipcDirectory);
+
+//! Apply \p paths as a Landlock ruleset to the calling process, denying every
+//! filesystem access the ABI can describe that the rules do not grant.
+//!
+//! Irreversible for the lifetime of the process, and inherited by children.
+//! Sets PR_SET_NO_NEW_PRIVS, which Landlock requires of an unprivileged
+//! caller. Must be called before any untrusted input is processed.
+ELandlockOutcome applyLandlockFilesystemPolicy(const SLandlockPaths& paths);
+
+} // namespace seccomp
+} // namespace ml
+
+#endif // INCLUDED_ml_seccomp_CLandlockFilesystemPolicy_h
