@@ -78,6 +78,16 @@ std::string describe(ESandbox2Capability capability);
 //! caller, which is why the probe forks first rather than unsharing inline.
 ESandbox2Capability probeSandbox2Capability();
 
+//! probeSandbox2Capability(), run at most once per process and cached.
+//!
+//! Every consumer of the verdict - the startup self-check and the spawn-time
+//! routing decision - must use this rather than probing independently, so
+//! the logged verdict and the route actually taken can never disagree. The
+//! first call pays for the probe (one short-lived forked child); the result
+//! is fixed for the life of the controller, which matches reality: whether
+//! the host permits user namespaces does not change under a running process.
+ESandbox2Capability sandbox2Capability();
+
 //! Log a one-time Sandbox2 environment self-check at INFO level, combining
 //! the active capability probe above with the passive host facts that help
 //! interpret it. No-op after the first call, and on platforms without

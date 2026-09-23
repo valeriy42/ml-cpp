@@ -269,8 +269,11 @@ bool CProcessSpawnerRouter::spawn(ERoute route,
         // inside one is not - deadlock in the forkserver's initial-namespace
         // setup rather than returning at all. The probe is cheap (one forked
         // child) and cached by the diagnostics layer's own one-shot log.
-        static const sandbox::ESandbox2Capability capability{
-            sandbox::probeSandbox2Capability()};
+        // The same cached verdict the startup self-check logged, never a
+        // second independent probe: two probes can disagree (one once did,
+        // when the controller's non-dumpable flag broke the later one), and
+        // then the log says one thing while the route does another.
+        const sandbox::ESandbox2Capability capability{sandbox::sandbox2Capability()};
 
         if (capability == sandbox::ESandbox2Capability::E_Available) {
             if (m_SandboxSpawner == nullptr) {

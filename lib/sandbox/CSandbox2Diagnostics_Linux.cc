@@ -56,6 +56,12 @@ std::string describe(ESandbox2Capability capability) {
     return "unrecognized capability value";
 }
 
+ESandbox2Capability sandbox2Capability() {
+    // Function-local static: initialised exactly once, thread-safely.
+    static const ESandbox2Capability capability{probeSandbox2Capability()};
+    return capability;
+}
+
 #if !defined(__linux__) || !defined(SANDBOX2_AVAILABLE)
 
 ESandbox2Capability probeSandbox2Capability() {
@@ -291,7 +297,7 @@ void logSandbox2EnvironmentSelfCheck() {
     }
     logged = true;
 
-    const ESandbox2Capability capability{probeSandbox2Capability()};
+    const ESandbox2Capability capability{sandbox2Capability()};
 
     // Passive host facts alongside the active result. These are what the
     // frozen prior art (ml-cpp#2873's CSandbox2Diagnostics) reported on its
