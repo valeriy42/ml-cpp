@@ -30,6 +30,10 @@ std::string describe(ELandlockOutcome outcome) {
     return "unrecognized outcome";
 }
 
+int landlockAbiVersion() {
+    return 0;
+}
+
 SLandlockPaths pytorchInferenceLandlockPaths(const std::string& /*ipcDirectory*/) {
     return SLandlockPaths{};
 }

@@ -11,6 +11,7 @@
 #include <sandbox/CSandbox2Diagnostics.h>
 
 #include <core/CLogger.h>
+#include <seccomp/CLandlockFilesystemPolicy.h>
 
 // Portable half: the capability vocabulary every platform may print, and the
 // no-op entry points a build without Sandbox2 links instead of the probe.
@@ -311,8 +312,24 @@ void logSandbox2EnvironmentSelfCheck() {
     const char* tmpDirEnv{::getenv("TMPDIR")};
     const std::string tmpDir{tmpDirEnv != nullptr ? tmpDirEnv : "/tmp"};
 
+    // Whether the Landlock fallback can run here. Reported on every node,
+    // not only when Sandbox2 is unavailable: an operator evaluating the
+    // fallback wants to know in advance, and on a capable host it is still
+    // useful to know which boundary a future kernel or runtime change would
+    // leave available.
+    const int landlockAbi{seccomp::landlockAbiVersion()};
+    std::string landlockStatus;
+    if (landlockAbi >= 1) {
+        landlockStatus = "available (ABI " + std::to_string(landlockAbi) + ")";
+    } else if (landlockAbi == 0) {
+        landlockStatus = "unsupported by this kernel";
+    } else {
+        landlockStatus = "denied by a seccomp filter or LSM";
+    }
+
     const std::string message{
         "Sandbox2 environment self-check: capability=" + describe(capability) +
+        ", landlock=" + landlockStatus +
         ", unprivileged_userns_clone=" + usernsSysctl +
         ", max_user_namespaces=" + maxUserNamespaces + ", TMPDIR=" + tmpDir +
         ", TMPDIR writable=" + (::access(tmpDir.c_str(), W_OK) == 0 ? "yes" : "no") +
@@ -325,8 +342,9 @@ void logSandbox2EnvironmentSelfCheck() {
         // launch if Elasticsearch actually asks for the Sandbox2 route. A
         // node that never sets sandbox_enabled=true runs unaffected, so this
         // is a warning about what *would* happen, not an error that happened.
-        LOG_WARN(<< message
-                 << " - a --requireSandbox launch on this host will fail closed");
+        LOG_WARN(<< message << " - a --requireSandbox launch on this host will "
+                 << (landlockAbi >= 1 ? "fall back to Landlock filesystem confinement"
+                                      : "fail closed"));
     }
 }
 

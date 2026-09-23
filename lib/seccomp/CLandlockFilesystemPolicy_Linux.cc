@@ -181,6 +181,14 @@ std::string describe(ELandlockOutcome outcome) {
     return "unrecognized outcome";
 }
 
+int landlockAbiVersion() {
+    const long abi{landlockCreateRuleset(nullptr, 0, ML_LANDLOCK_CREATE_RULESET_VERSION)};
+    if (abi >= 1) {
+        return static_cast<int>(abi);
+    }
+    return (errno == ENOSYS || errno == EOPNOTSUPP) ? 0 : -1;
+}
+
 SLandlockPaths pytorchInferenceLandlockPaths(const std::string& ipcDirectory) {
     SLandlockPaths paths;
 

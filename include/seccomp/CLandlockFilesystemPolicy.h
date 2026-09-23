@@ -78,6 +78,17 @@ enum class ELandlockOutcome {
 //! Human-readable one-line form of \p outcome.
 std::string describe(ELandlockOutcome outcome);
 
+//! Query, without applying anything, whether this process could use Landlock.
+//!
+//! \return the Landlock ABI version (>= 1) the kernel supports; 0 if the
+//! kernel has no Landlock (ENOSYS: older than 5.13 or compiled out;
+//! EOPNOTSUPP: built in but absent from the bootloader's lsm= list); or -1
+//! if the kernel supports it but a seccomp filter or LSM denied the query.
+//! The three cases have different remedies, so they are never collapsed.
+//! Safe to call from any process: asking for the ABI version creates no
+//! ruleset and restricts nothing.
+int landlockAbiVersion();
+
 //! The paths pytorch_inference needs, derived from its own resolved binary
 //! location and the directory its IPC pipes live in.
 //!
