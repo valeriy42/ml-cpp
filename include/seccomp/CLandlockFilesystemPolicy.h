@@ -53,15 +53,19 @@ namespace seccomp {
 //! this kernel understands, so a binary built anywhere runs correctly on any
 //! kernel.
 struct SLandlockPaths {
-    //! Directories and files the sandboxee may read and execute from, but
-    //! never modify - its own binary and library directories, the system
-    //! library directories the dynamic loader resolves through, and the
-    //! read-only system files libtorch consults.
+    //! Directories and files the sandboxee may read, and nothing else - never
+    //! write, and never execute. EXECUTE is deliberately withheld everywhere:
+    //! dlopen() opens and maps a library without it (only execve() needs it),
+    //! so withholding it makes Landlock alone refuse execve() even if the
+    //! seccomp filter that normally denies it failed to install.
     std::vector<std::string> s_ReadOnly;
 
-    //! The single per-child IPC directory the sandboxee owns. Read, write,
-    //! and FIFO creation - pytorch_inference creates its own log pipe there.
-    std::vector<std::string> s_ReadWrite;
+    //! Directories that may contain nothing but this process's own named
+    //! pipes: it may create a FIFO, open it for reading or writing, and unlink
+    //! it (CNamedPipeFactory unlinks each FIFO once connected). Creating a
+    //! regular file, directory, symlink or socket is denied, so the directory
+    //! cannot be used to fill the disk or stage data.
+    std::vector<std::string> s_PipeDirectories;
 };
 
 //! Outcome of applyLandlockFilesystemPolicy().
@@ -92,11 +96,19 @@ int landlockAbiVersion();
 //! The paths pytorch_inference needs, derived from its own resolved binary
 //! location and the directory its IPC pipes live in.
 //!
-//! \param ipcDirectory the directory holding the --input/--output/--restore/
-//! --logPipe paths. On the isolated-child-IPC layout this is
-//! $TMPDIR/ml-child-ipc/<deployment-id>, which confines the sandboxee to its
-//! own deployment's pipes; on the legacy flat layout it is $TMPDIR itself,
-//! which is correspondingly weaker because every deployment shares it.
+//! Derived from a trace of every Landlock-mediated operation pytorch_inference
+//! performs after the ruleset is applied - startup, model load and inference
+//! of the quantized ELSER model with two threads - plus the exceptions noted
+//! at each entry. Sensitive trees (/proc, /etc) are granted as exact files;
+//! whole directories are granted only where the contents are not sensitive
+//! and the exact set varies by CPU (the bundled library directory, from which
+//! oneMKL dlopen()s CPU-specific kernels, and the CPU topology in sysfs).
+//!
+//! \param ipcDirectory the per-child IPC directory
+//! $TMPDIR/ml-child-ipc/<deployment-id> holding the --input/--output/
+//! --restore/--logPipe pipes. Callers must not pass a shared directory: its
+//! pipe-directory rights include unlinking, which in a directory shared
+//! between deployments would let one sandboxee delete another's pipes.
 SLandlockPaths pytorchInferenceLandlockPaths(const std::string& ipcDirectory);
 
 //! Apply \p paths as a Landlock ruleset to the calling process, denying every

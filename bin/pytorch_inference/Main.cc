@@ -327,10 +327,25 @@ int main(int argc, char** argv) {
         // The IPC directory is the one writable location the sandboxee
         // needs; derive it from the log pipe, which is the one path option
         // Elasticsearch always sends.
-        std::string ipcDirectory{"/tmp"};
+        std::string ipcDirectory;
         const std::size_t lastSlash{logFileName.rfind('/')};
         if (lastSlash != std::string::npos && lastSlash > 0) {
             ipcDirectory = logFileName.substr(0, lastSlash);
+        }
+        // The pipe-directory grant includes unlinking. In a per-child
+        // directory that only ever holds this process's own pipes; in the
+        // legacy flat $TMPDIR it would let one sandboxee delete another
+        // deployment's pipes. Elasticsearch always uses the per-child layout
+        // on this route, so anything else is a caller bug - fail closed.
+        const std::size_t parentSlash{ipcDirectory.rfind('/')};
+        const std::string parent{parentSlash == std::string::npos
+                                     ? std::string{}
+                                     : ipcDirectory.substr(0, parentSlash)};
+        if (parent.size() < 13 || parent.compare(parent.size() - 13, 13, "/ml-child-ipc") != 0) {
+            LOG_FATAL(<< "--restrictFilesystem requires the per-child IPC directory layout "
+                         "($TMPDIR/ml-child-ipc/<deployment-id>/), but the log pipe is '"
+                      << logFileName << "'; refusing to process untrusted model input");
+            return EXIT_FAILURE;
         }
         const ml::seccomp::ELandlockOutcome landlockOutcome{
             ml::seccomp::applyLandlockFilesystemPolicy(

@@ -192,44 +192,50 @@ int landlockAbiVersion() {
 SLandlockPaths pytorchInferenceLandlockPaths(const std::string& ipcDirectory) {
     SLandlockPaths paths;
 
-    // The binary's own directory and its sibling lib directory, matching the
-    // <install>/bin + <install>/lib layout the Sandbox2 filesystem policy
-    // assumes. Resolved from /proc/self/exe rather than argv[0] so a
-    // relative launch path (the controller uses "./pytorch_inference")
-    // resolves correctly.
+    // The bundled library directory, <install>/lib beside <install>/bin.
+    // oneMKL dlopen()s a CPU-specific kernel from here on first use
+    // (libmkl_avx512.so.3 and libmkl_vml_avx512.so.3 on an AVX-512 host;
+    // avx2/mc3/def variants elsewhere), so the directory, not a file list, is
+    // granted. Everything else pytorch_inference links was mapped by the
+    // dynamic loader before main(), which is why neither its own bin
+    // directory nor any system library directory needs a grant.
     char exePath[PATH_MAX];
     const ssize_t exeLength{::readlink("/proc/self/exe", exePath, sizeof(exePath) - 1)};
     if (exeLength > 0) {
         exePath[exeLength] = '\0';
-        const std::string binDir{parentDirectory(exePath)};
-        paths.s_ReadOnly.push_back(binDir);
-        paths.s_ReadOnly.push_back(parentDirectory(binDir) + "/lib");
+        paths.s_ReadOnly.push_back(parentDirectory(parentDirectory(exePath)) + "/lib");
     }
 
-    // System library directories the dynamic loader resolves through. The
-    // bundled libraries are found via RPATH=$ORIGIN in the lib directory
-    // above, but libc/libstdc++/libgcc and anything dlopen()ed lazily - Intel
-    // oneMKL's CPU-specific kernels in particular - still come from here.
-    for (const char* systemDir : {"/lib", "/lib64", "/usr/lib", "/usr/lib64"}) {
-        paths.s_ReadOnly.push_back(systemDir);
-    }
-
-    // libtorch and glibc read these. /proc/self is needed because oneMKL's
-    // dispatcher reads /proc/self/exe and /proc/self/maps to locate itself
-    // before dlopen()ing its kernels - the same requirement that made the
-    // Sandbox2 policy mount a namespaced /proc. Granting /proc/self rather
-    // than /proc keeps the rest of the host process table unreadable.
-    paths.s_ReadOnly.push_back("/proc/self");
-    paths.s_ReadOnly.push_back("/etc");
+    // CPU topology. online/possible/present/kernel_max are what an x86_64
+    // run reads (libgomp and the CPU-feature detection behind the quantized
+    // kernels); aarch64 reads further per-CPU files beneath this directory,
+    // none of which are sensitive, so the directory is granted.
     paths.s_ReadOnly.push_back("/sys/devices/system/cpu");
-    paths.s_ReadOnly.push_back("/dev/urandom");
-    paths.s_ReadOnly.push_back("/dev/random");
 
-    // The one directory the sandboxee may modify. pytorch_inference creates
-    // its own log FIFO here, so this needs FIFO creation as well as
-    // read/write.
-    paths.s_ReadWrite.push_back(ipcDirectory);
-    paths.s_ReadWrite.push_back("/dev/null");
+    // CPU feature detection. Denying it does not fail the launch - it makes
+    // the quantized kernels silently take a different code path, which
+    // changed ELSER's output by up to ~3% in the trace this list comes from.
+    paths.s_ReadOnly.push_back("/proc/cpuinfo");
+
+    // The periodic memory reporter reads resident set size from here. Only
+    // this file: granting /proc/self would also expose environ, maps and fd,
+    // and granting /proc would expose every other process's.
+    paths.s_ReadOnly.push_back("/proc/self/statm");
+
+    // glibc loads the timezone lazily, on the first localtime() call, which
+    // happens after the ruleset is applied. Denying it only makes log
+    // timestamps UTC, but the file is not sensitive. A symlink to
+    // /usr/share/zoneinfo/... is resolved when the rule is added, so the rule
+    // covers the target file, not the zoneinfo tree.
+    paths.s_ReadOnly.push_back("/etc/localtime");
+
+    // Not read in the traced run (seeding uses getrandom()), but libstdc++'s
+    // std::random_device falls back to it where getrandom() or RDRAND is
+    // unavailable, and a failure there throws. Readable randomness is not
+    // sensitive.
+    paths.s_ReadOnly.push_back("/dev/urandom");
+
+    paths.s_PipeDirectories.push_back(ipcDirectory);
 
     return paths;
 }
@@ -271,21 +277,18 @@ ELandlockOutcome applyLandlockFilesystemPolicy(const SLandlockPaths& paths) {
     const int fd{static_cast<int>(rulesetFd)};
     bool ok{true};
 
-    const std::uint64_t readOnlyAccess{ACCESS_FS_EXECUTE | ACCESS_FS_READ_FILE | ACCESS_FS_READ_DIR};
+    // No EXECUTE: see SLandlockPaths::s_ReadOnly.
+    const std::uint64_t readOnlyAccess{ACCESS_FS_READ_FILE | ACCESS_FS_READ_DIR};
     for (const std::string& path : paths.s_ReadOnly) {
         ok = addPathRule(fd, path, readOnlyAccess, handled) && ok;
     }
 
-    // REFER is granted on the writable directory so a rename within it still
-    // works once REFER is handled (ABI 2+); without it, any cross-directory
-    // rename is denied outright even between two granted paths.
-    const std::uint64_t readWriteAccess{
-        ACCESS_FS_READ_FILE | ACCESS_FS_WRITE_FILE | ACCESS_FS_READ_DIR |
-        ACCESS_FS_REMOVE_FILE | ACCESS_FS_REMOVE_DIR | ACCESS_FS_MAKE_REG |
-        ACCESS_FS_MAKE_DIR | ACCESS_FS_MAKE_FIFO | ACCESS_FS_MAKE_SOCK |
-        ACCESS_FS_MAKE_SYM | ACCESS_FS_REFER | ACCESS_FS_TRUNCATE | ACCESS_FS_IOCTL_DEV};
-    for (const std::string& path : paths.s_ReadWrite) {
-        ok = addPathRule(fd, path, readWriteAccess, handled) && ok;
+    // Exactly what CNamedPipeFactory does in the IPC directory: mkfifo(),
+    // open the FIFO for reading or writing, and unlink() it once connected.
+    const std::uint64_t pipeDirectoryAccess{ACCESS_FS_MAKE_FIFO | ACCESS_FS_READ_FILE |
+                                            ACCESS_FS_WRITE_FILE | ACCESS_FS_REMOVE_FILE};
+    for (const std::string& path : paths.s_PipeDirectories) {
+        ok = addPathRule(fd, path, pipeDirectoryAccess, handled) && ok;
     }
 
     if (ok == false) {
@@ -310,7 +313,7 @@ ELandlockOutcome applyLandlockFilesystemPolicy(const SLandlockPaths& paths) {
     ::close(fd);
     LOG_INFO(<< "{\"event\":\"landlock_applied\",\"abi\":" << abi
              << ",\"read_only_paths\":" << paths.s_ReadOnly.size()
-             << ",\"read_write_paths\":" << paths.s_ReadWrite.size() << "}");
+             << ",\"pipe_directories\":" << paths.s_PipeDirectories.size() << "}");
     return ELandlockOutcome::E_Applied;
 }
 

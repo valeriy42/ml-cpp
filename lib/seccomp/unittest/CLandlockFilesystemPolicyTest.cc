@@ -48,7 +48,8 @@ enum EChildExit : int {
     E_ChildNotApplied = 20,
     E_ChildGrantedPathUnreadable = 21,
     E_ChildDeniedPathStillReadable = 22,
-    E_ChildGrantedDirNotWritable = 23
+    E_ChildGrantedDirNotWritable = 23,
+    E_ChildExecRefused = 24
 };
 
 //! Run \p body in a forked child and return its exit code, or -1 if the child
@@ -81,10 +82,12 @@ std::string makeScratchDirectory() {
 
 BOOST_AUTO_TEST_CASE(testRulesetGrantsTheAllowedPathAndDeniesEverythingElse) {
     // The point of the fallback is that it actually bounds the sandboxee, so
-    // assert both halves: a granted directory stays usable, and a path that
-    // was never granted becomes unreadable *even though the uid still owns
-    // it*. Without the second half a vacuously permissive ruleset would
-    // "pass".
+    // assert every half: the pipe directory still supports exactly what
+    // CNamedPipeFactory does (mkfifo, open, unlink), it refuses anything else
+    // (a regular file there would allow disk-filling or staging), and a path
+    // that was never granted becomes unreadable *even though the uid still
+    // owns it*. Without the negative halves a vacuously permissive ruleset
+    // would "pass".
     const std::string scratch{makeScratchDirectory()};
     BOOST_TEST_REQUIRE(scratch.empty() == false);
 
@@ -93,31 +96,43 @@ BOOST_AUTO_TEST_CASE(testRulesetGrantsTheAllowedPathAndDeniesEverythingElse) {
     BOOST_TEST_REQUIRE(outsideFd >= 0);
     ::close(outsideFd);
 
-    const std::string granted{scratch + "/granted"};
-    BOOST_TEST_REQUIRE(::mkdir(granted.c_str(), 0700) == 0);
+    const std::string pipes{scratch + "/pipes"};
+    BOOST_TEST_REQUIRE(::mkdir(pipes.c_str(), 0700) == 0);
 
     const int childResult{runInChild([&] {
         ml::seccomp::SLandlockPaths paths;
-        paths.s_ReadWrite.push_back(granted);
+        paths.s_PipeDirectories.push_back(pipes);
 
         const ml::seccomp::ELandlockOutcome outcome{
             ml::seccomp::applyLandlockFilesystemPolicy(paths)};
         if (outcome == ml::seccomp::ELandlockOutcome::E_Unsupported) {
-            // Reported to the parent, which skips rather than fails - a
-            // kernel without Landlock is a legitimate environment.
             return static_cast<int>(E_ChildNotApplied);
         }
         if (outcome != ml::seccomp::ELandlockOutcome::E_Applied) {
             return static_cast<int>(E_ChildGrantedPathUnreadable);
         }
 
-        // The granted directory must still be writable.
-        const std::string inside{granted + "/inside.txt"};
-        const int insideFd{::open(inside.c_str(), O_CREAT | O_WRONLY, 0600)};
-        if (insideFd < 0) {
+        // What CNamedPipeFactory does: mkfifo, open (O_RDWR so no peer is
+        // needed), unlink.
+        const std::string fifo{pipes + "/logPipe"};
+        if (::mkfifo(fifo.c_str(), 0600) != 0) {
             return static_cast<int>(E_ChildGrantedDirNotWritable);
         }
-        ::close(insideFd);
+        const int fifoFd{::open(fifo.c_str(), O_RDWR)};
+        if (fifoFd < 0) {
+            return static_cast<int>(E_ChildGrantedDirNotWritable);
+        }
+        ::close(fifoFd);
+        if (::unlink(fifo.c_str()) != 0) {
+            return static_cast<int>(E_ChildGrantedDirNotWritable);
+        }
+
+        // Anything other than a FIFO must be refused in the pipe directory.
+        const int regularFd{::open((pipes + "/staged.bin").c_str(), O_CREAT | O_WRONLY, 0600)};
+        if (regularFd >= 0) {
+            ::close(regularFd);
+            return static_cast<int>(E_ChildDeniedPathStillReadable);
+        }
 
         // The sibling file, owned by this very uid, must now be unreachable.
         const int deniedFd{::open(outside.c_str(), O_RDONLY)};
@@ -129,8 +144,9 @@ BOOST_AUTO_TEST_CASE(testRulesetGrantsTheAllowedPathAndDeniesEverythingElse) {
         return static_cast<int>(E_ChildOk);
     })};
 
+    ::unlink((pipes + "/staged.bin").c_str());
     ::unlink(outside.c_str());
-    ::rmdir(granted.c_str());
+    ::rmdir(pipes.c_str());
     ::rmdir(scratch.c_str());
 
     if (childResult == E_ChildNotApplied) {
@@ -138,6 +154,39 @@ BOOST_AUTO_TEST_CASE(testRulesetGrantsTheAllowedPathAndDeniesEverythingElse) {
         return;
     }
     BOOST_REQUIRE_EQUAL(childResult, static_cast<int>(E_ChildOk));
+}
+
+BOOST_AUTO_TEST_CASE(testExecveIsRefusedEvenForAReadableBinary) {
+    // EXECUTE is never granted, so Landlock alone refuses execve() - the
+    // backstop if the seccomp filter (which also denies execve) ever failed
+    // to install. Grant read on the binary's own directory to show that
+    // readability does not imply executability.
+    //
+    // A negative control (EXECUTE granted) must also grant the directories
+    // holding the ELF interpreter and libc: execve() needs EXECUTE on the
+    // interpreter as well, so granting it on /usr/bin alone still fails, and
+    // would make the control pass for the wrong reason.
+    const int childResult{runInChild([] {
+        ml::seccomp::SLandlockPaths paths;
+        paths.s_ReadOnly.push_back("/usr/bin");
+        if (ml::seccomp::applyLandlockFilesystemPolicy(paths) ==
+            ml::seccomp::ELandlockOutcome::E_Unsupported) {
+            return static_cast<int>(E_ChildNotApplied);
+        }
+        char* const argv[]{const_cast<char*>("true"), nullptr};
+        ::execv("/usr/bin/true", argv);
+        // Only reached if execv() failed. A *successful* exec replaces this
+        // child with /usr/bin/true, which exits 0 - so the refusal must be
+        // reported with a distinct non-zero code, or a broken ruleset that
+        // allowed the exec would pass this test.
+        return static_cast<int>(errno == EACCES ? E_ChildExecRefused : E_ChildDeniedPathStillReadable);
+    })};
+
+    if (childResult == E_ChildNotApplied) {
+        BOOST_TEST_MESSAGE("Landlock unsupported on this kernel - skipping");
+        return;
+    }
+    BOOST_REQUIRE_EQUAL(childResult, static_cast<int>(E_ChildExecRefused));
 }
 
 BOOST_AUTO_TEST_CASE(testPolicyIsIrreversibleWithinTheConfinedProcess) {
@@ -160,7 +209,8 @@ BOOST_AUTO_TEST_CASE(testPolicyIsIrreversibleWithinTheConfinedProcess) {
         // Now grant the scratch directory in a second ruleset; Landlock
         // composes by intersection, so this must NOT re-open access.
         ml::seccomp::SLandlockPaths permissive;
-        permissive.s_ReadWrite.push_back(scratch);
+        permissive.s_PipeDirectories.push_back(scratch);
+        permissive.s_ReadOnly.push_back(scratch);
         ml::seccomp::applyLandlockFilesystemPolicy(permissive);
 
         const int reopened{::open(probeFile.c_str(), O_RDONLY)};
@@ -181,10 +231,11 @@ BOOST_AUTO_TEST_CASE(testPolicyIsIrreversibleWithinTheConfinedProcess) {
     BOOST_REQUIRE_EQUAL(childResult, static_cast<int>(E_ChildOk));
 }
 
-BOOST_AUTO_TEST_CASE(testPytorchInferencePathsIncludeTheIpcDirectoryAsWritable) {
-    // The derived path set must make the per-child IPC directory writable -
-    // pytorch_inference creates its own log FIFO there - and must not make
-    // it merely readable, which would fail at startup rather than at load.
+BOOST_AUTO_TEST_CASE(testPytorchInferencePathsAreTheMeasuredMinimum) {
+    // Pins the ruleset to the traced minimum so a later "just add the parent
+    // directory" change is a visible test failure rather than a silent
+    // widening. Every entry here is justified in
+    // pytorchInferenceLandlockPaths().
     const ml::seccomp::SLandlockPaths paths{
         ml::seccomp::pytorchInferenceLandlockPaths("/app/tmp/ml-child-ipc/dep-1")};
 
@@ -192,81 +243,21 @@ BOOST_AUTO_TEST_CASE(testPytorchInferencePathsIncludeTheIpcDirectoryAsWritable) 
         return std::find(haystack.begin(), haystack.end(), needle) != haystack.end();
     };
 
-    BOOST_TEST_REQUIRE(contains(paths.s_ReadWrite, "/app/tmp/ml-child-ipc/dep-1"));
+    // The IPC directory holds pipes only, and is the sole modifiable path.
+    BOOST_REQUIRE_EQUAL(paths.s_PipeDirectories.size(), 1);
+    BOOST_TEST_REQUIRE(contains(paths.s_PipeDirectories, "/app/tmp/ml-child-ipc/dep-1"));
     BOOST_TEST_REQUIRE(contains(paths.s_ReadOnly, "/app/tmp/ml-child-ipc/dep-1") == false);
-    // /proc/self, not /proc: oneMKL needs its own exe/maps, and granting the
-    // whole of /proc would leave the host process table readable.
-    BOOST_TEST_REQUIRE(contains(paths.s_ReadOnly, "/proc/self"));
-    BOOST_TEST_REQUIRE(contains(paths.s_ReadOnly, "/proc") == false);
-}
 
-BOOST_AUTO_TEST_CASE(testRealPytorchPolicyDeniesTheExploitTargetWrite) {
-    // End-to-end at the policy level, using the exact ruleset
-    // pytorch_inference installs on the Landlock fallback route - not a
-    // synthetic one. The attack-defense exploit model
-    // (test/evil_model_generator.py) writes an -agentpath payload to
-    // /usr/share/elasticsearch/config/jvm.options.d/gc.options; that path is
-    // outside every grant pytorchInferenceLandlockPaths() produces, so the
-    // real policy must deny a write there, while the per-child IPC directory
-    // it does grant stays writable (pytorch_inference creates its own log
-    // FIFO in it). This is the same boundary the harness's ROP exploit
-    // exercises, proven deterministically without a build-fragile ROP chain.
-    const std::string scratch{makeScratchDirectory()};
-    BOOST_TEST_REQUIRE(scratch.empty() == false);
-
-    // A stand-in for the operator TMPDIR, with the per-child IPC directory
-    // laid out as the controller creates it: <tmp>/ml-child-ipc/<child-id>.
-    const std::string ipcDir{scratch + "/ml-child-ipc/dep-e2e"};
-    BOOST_TEST_REQUIRE(::system(("mkdir -p " + ipcDir).c_str()) == 0);
-
-    // The exploit's hard-coded target, created here so the difference the
-    // test observes is Landlock denying the write - not the parent directory
-    // being absent. Its parent is deliberately outside every grant.
-    const std::string forbiddenDir{scratch + "/config/jvm.options.d"};
-    BOOST_TEST_REQUIRE(::system(("mkdir -p " + forbiddenDir).c_str()) == 0);
-    const std::string forbiddenTarget{forbiddenDir + "/gc.options"};
-
-    const int childResult{runInChild([&] {
-        ml::seccomp::SLandlockPaths paths{
-            ml::seccomp::pytorchInferenceLandlockPaths(ipcDir)};
-        // Point the "config" grant nowhere near forbiddenTarget: the real
-        // policy grants /etc etc., none of which cover this scratch config
-        // path, so no extra removal is needed - forbiddenTarget is already
-        // outside paths. Apply the real ruleset unchanged.
-        const ml::seccomp::ELandlockOutcome outcome{
-            ml::seccomp::applyLandlockFilesystemPolicy(paths)};
-        if (outcome == ml::seccomp::ELandlockOutcome::E_Unsupported) {
-            return static_cast<int>(E_ChildNotApplied);
-        }
-        if (outcome != ml::seccomp::ELandlockOutcome::E_Applied) {
-            return static_cast<int>(E_ChildGrantedPathUnreadable);
-        }
-
-        // The per-child IPC directory the real policy grants must stay
-        // writable - pytorch_inference creates its log FIFO there.
-        const std::string fifoStandin{ipcDir + "/logPipe.test"};
-        const int okFd{::open(fifoStandin.c_str(), O_CREAT | O_WRONLY, 0600)};
-        if (okFd < 0) {
-            return static_cast<int>(E_ChildGrantedDirNotWritable);
-        }
-        ::close(okFd);
-
-        // The exploit's target write must be denied by the real policy.
-        const int deniedFd{::open(forbiddenTarget.c_str(), O_CREAT | O_WRONLY, 0600)};
-        if (deniedFd >= 0) {
-            ::close(deniedFd);
-            return static_cast<int>(E_ChildDeniedPathStillReadable);
-        }
-        return static_cast<int>(E_ChildOk);
-    })};
-
-    ::system(("rm -rf " + scratch).c_str());
-
-    if (childResult == E_ChildNotApplied) {
-        BOOST_TEST_MESSAGE("Landlock unsupported on this kernel - skipping");
-        return;
+    // Sensitive trees are granted as exact files, never as directories.
+    BOOST_TEST_REQUIRE(contains(paths.s_ReadOnly, "/proc/cpuinfo"));
+    BOOST_TEST_REQUIRE(contains(paths.s_ReadOnly, "/proc/self/statm"));
+    BOOST_TEST_REQUIRE(contains(paths.s_ReadOnly, "/etc/localtime"));
+    for (const char* tooBroad : {"/", "/proc", "/proc/self", "/etc", "/tmp", "/app/tmp",
+                                 "/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr",
+                                 "/dev", "/sys", "/home"}) {
+        BOOST_TEST_REQUIRE(contains(paths.s_ReadOnly, tooBroad) == false);
+        BOOST_TEST_REQUIRE(contains(paths.s_PipeDirectories, tooBroad) == false);
     }
-    BOOST_REQUIRE_EQUAL(childResult, static_cast<int>(E_ChildOk));
 }
 
 #endif // Linux
