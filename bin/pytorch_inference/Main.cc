@@ -415,7 +415,18 @@ int main(int argc, char** argv) {
     // of a fatal log line above. Empty (never emitted) on the Sandbox2
     // route, which installs no in-process filter to attest.
     if (seccompResult.s_AttestationMarker.empty() == false) {
-        LOG_INFO(<< seccompResult.s_AttestationMarker);
+        // The marker names the route this filter belongs to. On the Landlock
+        // route the same in-process filter is installed - Landlock and
+        // seccomp are meant to stack - but reporting it as "legacy" would
+        // contradict the controller's sandbox2_launch signal (mode
+        // "landlock") for the same launch.
+        std::string marker{seccompResult.s_AttestationMarker};
+        const std::string legacyRoute{"\"ml_sandbox2_route\":\"legacy\""};
+        const std::size_t pos{marker.find(legacyRoute)};
+        if (restrictFilesystem && pos != std::string::npos) {
+            marker.replace(pos, legacyRoute.size(), "\"ml_sandbox2_route\":\"landlock\"");
+        }
+        LOG_INFO(<< marker);
     }
 
     if (ioMgr.initIo() == false) {
